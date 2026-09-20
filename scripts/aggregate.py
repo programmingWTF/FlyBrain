@@ -142,9 +142,11 @@ def _plot(rows, groups, path):
                     label=f"{arch} seed{r.get('seed')}")
     ax.set_xlabel("env steps")
     ax.set_ylabel("greedy eval mean score")
-    ax.set_title("学习曲线（贪心评测）")
+    # 图注用英文：matplotlib 默认字体没有中文字形，写了会变成方块
+    ax.set_title("Learning curves (greedy eval)")
     ax.grid(alpha=0.3)
-    ax.legend(fontsize=8)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8)
 
     ax2 = axes[1]
     labels, data = [], []
@@ -154,11 +156,15 @@ def _plot(rows, groups, path):
         labels.append(arch)
         data.append([r["final_eval"]["mean"] for r in groups[arch]])
     if data:
-        ax2.boxplot(data, labels=labels)
+        # matplotlib >= 3.9 把 boxplot 的 labels 改名成 tick_labels
+        try:
+            ax2.boxplot(data, tick_labels=labels)
+        except TypeError:
+            ax2.boxplot(data, labels=labels)
         for i, d in enumerate(data, start=1):
             ax2.scatter([i] * len(d), d, zorder=3, s=24)
     ax2.set_ylabel("final greedy eval mean score")
-    ax2.set_title("最终分数（每个 run 一个点）")
+    ax2.set_title("Final score per run")
     ax2.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=120)

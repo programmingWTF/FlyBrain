@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlyBrain 训练监控</title>
+<style>
+  :root { --bg:#0a0d13; --card:#111722; --line:#1e2733; --fg:#e6edf3; --dim:#8b98a8; --acc:#4dd2ff; }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; padding:18px 20px 40px; background:var(--bg); color:var(--fg);
+    font:13px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  h1 { margin:0 0 2px; font-size:17px; font-weight:600; letter-spacing:.3px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:14px; }
+  .sub b { color:var(--fg); font-weight:600; }
+
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:9px; padding:10px 13px; }
+  .card .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .card .v { font-size:20px; font-weight:600; font-variant-numeric:tabular-nums; margin-top:2px; }
+  .card .v small { font-size:12px; color:var(--dim); font-weight:400; }
+  .bar { height:5px; background:#1a222e; border-radius:3px; overflow:hidden; margin-top:7px; }
+  .bar > i { display:block; height:100%; background:linear-gradient(90deg,#2b8fd6,#4dd2ff); }
+
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  th { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; font-weight:500; }
+  tr.done { opacity:.62; }
+  tr.stopped { opacity:.5; }
+  .tag { font-family:ui-monospace,Consolas,monospace; font-size:12px; }
+  .arch { display:inline-block; padding:1px 7px; border-radius:20px; font-size:11px; }
+  .arch.connectome { background:#12303f; color:#4dd2ff; }
+  .arch.rewired    { background:#3a2a12; color:#ffb454; }
+  .arch.mlp        { background:#2a1f3a; color:#c08cff; }
+  .arch\.q         { background:#222; color:#999; }
+  .pb { position:relative; background:#1a222e; border-radius:4px; height:15px; min-width:110px; overflow:hidden; }
+  .pb > i { position:absolute; inset:0 auto 0 0; background:linear-gradient(90deg,#1f6fa8,#3fb6e8); }
+  .pb > span { position:relative; padding-left:6px; font-size:11px; line-height:15px; }
+  .pill { padding:1px 7px; border-radius:20px; font-size:11px; white-space:nowrap; }
+  .pill.run   { background:#0d2f1c; color:#5ee08a; }
+  .pill.stop  { background:#33191c; color:#ff7a7a; }
+  .pill.done  { background:#1b2430; color:#9fb0c3; }
+  .pill.idle  { background:#1b2430; color:#66788c; }
+  .dev.gpu { color:#5ee08a; } .dev.cpu { color:#ffb454; }
+  .err { background:#33191c; border:1px solid #5a2a2a; color:#ffb0b0; padding:12px; border-radius:8px; }
+  #foot { color:var(--dim); font-size:11.5px; margin-top:14px; }
+</style>
+</head>
+<body>
+  <h1>FlyBrain · 连接组 × FlappyBird 训练监控</h1>
+  <div class="sub" id="sub">正在连接 …</div>
+
+  <div class="cards" id="cards"></div>
+
+  <div id="err"></div>
+  <table>
+    <thead>
+      <tr>
+        <th>run</th><th>架构</th><th>设备</th><th>进度</th>
+        <th>steps/s</th><th>剩余</th><th>近期均分</th><th>loss</th><th>eps</th>
+        <th>已跑</th><th>状态</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div id="foot"></div>
+
+<script>
+const REFRESH = 5000;
+const $ = (id) => document.getElementById(id);
+
+const ARCH_LABEL = { connectome: '真实接线', rewired: '随机图', mlp: 'MLP 基线' };
+
+function fmtMin(m) {
+  if (m === null || m === undefined) return '—';
+  if (m < 60) return m.toFixed(0) + ' min';
+  const h = Math.floor(m / 60), r = Math.round(m % 60);
+  return h + ' h ' + String(r).padStart(2, '0') + ' min';
+}
+function fmtNum(v, d = 2) { return (v === null || v === undefined) ? '—' : Number(v).toFixed(d); }
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+async function tick() {
+  let d;
+  try {
+    const r = await fetch('/api/status', { cache: 'no-store' });
+    d = await r.json();
+  } catch (e) {
+    $('err').innerHTML = `<div class="err">取状态失败：${esc(e.message)}</div>`;
+    return;
+  }
+  if (d.error) {
+    $('err').innerHTML = `<div class="err">${esc(d.error)}<pre style="margin:6px 0 0;white-space:pre-wrap">${esc(d.detail || '')}</pre></div>`;
+    return;
+  }
+  $('err').innerHTML = '';
+
+  const s = d.summary, g = d.gpu || {}, sys = d.sys || {};
+  $('sub').innerHTML = `更新于 ${new Date(d.now * 1000).toLocaleTimeString()} ·
+    运行中 <b>${s.running}</b> / 共 <b>${s.total}</b> · 已完成 <b>${s.done}</b>
+    ${s.critical_path ? ` · 关键路径 <b>${esc(s.critical_path)}</b>` : ''}`;
+
+  const cards = [
+    { k: 'GPU 利用率', v: g.util === null ? '—' : g.util + ' %', p: g.util || 0 },
+    { k: 'GPU 显存', v: g.mem_used === null ? '—' : `${(g.mem_used/1024).toFixed(1)} <small>/ ${(g.mem_total/1024).toFixed(0)} GB</small>`, p: g.mem_used ? g.mem_used/g.mem_total*100 : 0 },
+    { k: 'CPU', v: sys.percent === null ? '—' : sys.percent + ' %', p: sys.percent || 0 },
+    { k: '内存', v: sys.ram_used_gb ? `${sys.ram_used_gb.toFixed(1)} <small>/ ${sys.ram_total_gb.toFixed(0)} GB</small>` : '—', p: sys.ram_used_gb ? sys.ram_used_gb/sys.ram_total_gb*100 : 0 },
+    { k: '最长剩余', v: s.max_eta_min ? fmtMin(s.max_eta_min) : '—', p: 0 },
+  ];
+  $('cards').innerHTML = cards.map(c => `
+    <div class="card">
+      <div class="k">${c.k}</div>
+      <div class="v">${c.v}</div>
+      ${c.p ? `<div class="bar"><i style="width:${Math.min(100, c.p).toFixed(0)}%"></i></div>` : ''}
+    </div>`).join('');
+
+  const runs = d.runs.slice().sort((a, b) => {
+    const rank = r => r.status.startsWith('✅') ? 2 : (r.running ? 0 : 1);
+    const dr = rank(a) - rank(b);
+    if (dr) return dr;
+    return (b.eta_min || 0) - (a.eta_min || 0);
+  });
+
+  $('rows').innerHTML = runs.map(r => {
+    const pct = Math.min(100, r.step / r.target * 100);
+    const cls = r.status.startsWith('✅') ? 'done' : (r.running ? '' : 'stopped');
+    const pill = r.status.startsWith('✅') ? 'done' : (r.running ? 'run' : 'stop');
+    const al = ARCH_LABEL[r.arch] || r.arch;
+    const devc = r.device === 'cuda' ? 'gpu' : (r.device === 'cpu' ? 'cpu' : '');
+    return `<tr class="${cls}">
+      <td class="tag">${esc(r.tag)}</td>
+      <td><span class="arch ${r.arch}">${esc(al)}</span></td>
+      <td class="dev ${devc}">${esc(r.device)}</td>
+      <td><div class="pb"><i style="width:${pct.toFixed(1)}%"></i>
+          <span>${r.step.toLocaleString()} / ${r.target.toLocaleString()}</span></div></td>
+      <td>${r.rate ? r.rate.toFixed(1) : '—'}</td>
+      <td>${r.status.startsWith('✅') ? '—' : fmtMin(r.eta_min)}</td>
+      <td>${r.final_mean !== null ? `<b>${r.final_mean.toFixed(1)}</b> <small>(max ${r.final_max})</small>`
+            : fmtNum(r.recent_score, 1)}</td>
+      <td>${fmtNum(r.loss, 4)}</td>
+      <td>${fmtNum(r.eps, 3)}</td>
+      <td>${r.wall_min === null ? '—' : fmtMin(r.wall_min)}</td>
+      <td><span class="pill ${pill}">${esc(r.status)}</span></td>
+    </tr>`;
+  }).join('');
+
+  $('foot').textContent = `每 ${REFRESH/1000} 秒自动刷新 · 数据源 runs/*/log.csv 与 summary.json · 近期均分 = 训练中最近 100 局的均值`;
+}
+
+tick();
+setInterval(tick, REFRESH);
+</script>
+</body>
+</html>
