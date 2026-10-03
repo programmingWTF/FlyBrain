@@ -253,58 +253,25 @@ function physics(dt) {
   // ---- 碰撞：**圆 vs 轴对齐矩形**，与 D:/Code/DQN 的 `FlappySim._collides` 同一判据。
   //      (bx-cx)² + (by-cy)² <= r²，其中 (cx,cy) 是矩形上离圆心最近的点，
   //      管子就是两个矩形 [x, 0, PIPE_W, top] 和 [x, top+GAP, PIPE_W, ground]。
-  // 因为矩形竖直方向是连续的，最近点的 cy 恒等于 by，所以竖直条件化简为
-  //      by - r <= top   或   by + r >= top + GAP
-  // 用"<= / >="（触碰即算撞）与 DQN 一致；边界是坐标，画图那边按坐标-1 对齐像素。
+  // 因为矩形竖直方向是连续的，最近点的 cy 恒等于 by，所以竖直条件化简为下面两条。
+  //
+  // ⚠️ 必须是**严格**不等式 —— 这是「碰到管子要判死」的唯一修正。
+  // 画出来的管子是像素块：块从索引 h 起、高 len，覆盖的是**坐标** [h, h+len)。
+  //   上管覆盖像素 [0, p.top+R]        → 几何下沿在坐标 p.top+R+1
+  //   下管覆盖像素 [p.top+GAP-R-1, …]  → 几何上沿在坐标 p.top+GAP-R-1
+  // 鸟圆周下沿 y+R、上沿 y-R，所以"真的重叠"就是：
+  //   y + R > p.top + GAP   或   y - R < p.top
+  // 原来用 <= / >=，判定整体比画面**小 1px**：圆周已经压进管子、视觉明显重叠，
+  // 判定却不触发 —— 就是用户报的「碰到柱子不死」。
   if (G.y + BIRD_R >= G.H - 14) return die('撞到地面');
   if (G.y - BIRD_R <= 0) return die('撞到天花板');
   for (const p of G.pipes) {
     const cx = Math.max(p.x, Math.min(G.birdX, p.x + PIPE_W));   // 矩形上最近的 x
     if ((G.birdX - cx) ** 2 > BIRD_R ** 2) continue;             // 水平还没够到
-    // 严格不等式才是与画面严格一致的那一组（这里来回错过三次，根因是像素/坐标混用）：
-    //   画出来的管子是像素块；块从索引 h 起、高 len，覆盖**坐标** [h, h+len)。
-    //   上管覆盖像素 [0, p.top+R] → 几何下沿坐标 p.top+R+1；
-    //   下管覆盖像素 [p.top+GAP-R-1, ...] → 几何上沿坐标 p.top+GAP-R-1。
-    //   圆周下沿 y+R、上沿 y-R，所以真的重叠 ⟺ 下面这两条。
-    //   写成 y-R <= p.top || y+R >= p.top+GAP 会让判定整体比画面小 1px，
-    //   表现就是用户报的【碰到柱子不死】。
-    // demo/verify_collision_exact.js 扫管子 x 逐个圆心 y 对账（漏判必须为 0）。
     if (G.y - BIRD_R < p.top || G.y + BIRD_R > p.top + GAP) return die('撞上管子');
   }
-  assertNoVisualOverlap();
 }
 function die(cause) { if (!G.dead) { G.dead = true; G.cause = cause; G.deadT = 0; } }
-
-/** 运行时自检：按**当前状态**重算管子矩形，做一次圆-矩形重叠判断，
- *  检查「画面上已经重叠、但还没判死」的情形，记进 `DBG.passThrough`。
- *
- *  为什么需要：离线校验器能证明几何公式一致，但证明不了**运行时**用的是不是
- *  同一组数。用户反复报「碰到管子不死」，这里把「有没有漏判」变成可观测的事实。
- *
- *  ⚠️ 必须按当前状态重算，不能用渲染时记下的矩形 —— 那是上一帧的，而管子每 tick
- *     移动约 4.8px，会因为「管子已经移走」报假穿透（实测踩过）。
- *     守卫也要与 physics() 的提前 return 一致，否则会在没做判定的 tick 上比对。 */
-function assertNoVisualOverlap() {
-  if (G.dead || (G.warmupT || 0) < WARMUP_S) return;
-  DBG.checked = (DBG.checked || 0) + 1;
-  for (const p of G.pipes) {
-    const rects = [[p.x, 0, PIPE_W, p.top + BIRD_R + 1],
-                   [p.x, p.top + GAP - BIRD_R - 1, PIPE_W, G.H]];
-    for (const [rx, ry, rw, rh] of rects) {
-      const cx = Math.max(rx, Math.min(G.birdX, rx + rw));
-      const cy = Math.max(ry, Math.min(G.y, ry + rh));
-      const d2 = (G.birdX - cx) ** 2 + (G.y - cy) ** 2;
-      // 严格小于：相切（d == R）不算穿透，与 physics() 的严格不等式同语义
-      if (d2 < BIRD_R ** 2 - 1e-9) {
-        DBG.passThrough = (DBG.passThrough || 0) + 1;
-        DBG.passThroughLast = { y: Math.round(G.y), cx: Math.round(cx),
-          cy: Math.round(cy), rect: [rx, ry, rw, rh],
-          dist: Math.round(Math.sqrt(d2) * 100) / 100, R: BIRD_R };
-        return;
-      }
-    }
-  }
-}
 
 // ============================================================ 经典 FlappyBird 画面
 const GROUND = 92;                       // 地面高度（像素）
@@ -472,7 +439,9 @@ function drawGame() {
     // 下管从 top+GAP-R 起画。"最后一个被挡住的像素"比坐标大 1。
     // demo/verify_pipe_visual.js 覆盖全 x 范围逐像素守着这一点。
     drawPipe(g, p.x, 0, p.top + BIRD_R + 1);              // 上管
-    drawPipe(g, p.x, p.top + GAP - BIRD_R - 1, G.H);      // 下管（像素带闭区间，再收 1px）
+    // 下管画到 top+GAP-R-1：与严格不等式 `y+R > top+GAP` 的判定边界严格对齐
+    // （少这 1px 会多画一格，偏向"提前判死"；多画不会漏判，但两边就不是严格相等了）
+    drawPipe(g, p.x, p.top + GAP - BIRD_R - 1, G.H);      // 下管
   }
   drawGround(g);
   drawBirdSprite(g);
