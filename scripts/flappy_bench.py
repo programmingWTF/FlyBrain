@@ -82,10 +82,14 @@ INF = float("inf")
 class World:
     """只包含游戏物理 + 几何，不知道脑的存在。"""
 
-    def __init__(self, rng: np.random.Generator, *, gap_top, solvable: bool = True):
+    def __init__(self, rng: np.random.Generator, *, gap_top, solvable: bool = True,
+                 max_climb: float = 40.0):
         self.rng = rng
         self.gap_top = gap_top
         self.solvable = solvable
+        # 相邻缺口允许的**向上**跳变上限（px）。默认 110 ≈ 一个管距内
+        # 可持续爬升的高度（100 px/s × 1.25 s = 125px），取略保守的值。
+        self.max_climb = max_climb
         self.reset()
 
     def reset(self) -> None:
@@ -113,16 +117,40 @@ class World:
         self.spawned += 1
 
     def _next_gap_top(self) -> float:
+        """生成下一根管子的缺口。
+
+        `solvable=False` 时就是前端的原始做法：gapTop ~ U(70, 400)，缺口中心
+        在 y∈[154,624] 上均匀随机 —— 相邻两根的缺口**平均跳变 157px、最大 330px**。
+
+        为什么需要可解性约束（这是本节最重要的一条实测）
+        ------------------------------------------------
+        `scripts/flappy_trace_death.py` 量到：鸟的可持续爬升率只有 **~100 px/s**
+        （拍翅一次买 49px、周期 ~0.4s；而且上冲期地面驱动被 `vy_gate` 关掉，
+        膜电位要重新积分才够下一次）。管距 300px / 240px·s⁻¹ = **1.25 s**，
+        所以一个间隔内最多爬 ~125px。而缺口的随机跳变有 330px 的量程：
+        **超过这个带宽的"向上跳变"在给定物理下根本飞不进去**，不是脑的问题。
+        `scripts/flappy_spacing.py` 独立验证了这一点（管距 200→400px 时
+        均分 4.20→12.28，≤2 分占比 40%→20%）。
+
+        所以这里把"相邻缺口的向上跳变"限到执行器带宽以内：
+            next_center ≥ prev_center − max_climb
+        向下不设限——自由落体快得多（1.25s 可掉 921px > 量程 470px）。
+        注意这**不是**降低游戏难度：它只排除物理上不可达的关卡，
+        与"把缺口调大/把管子调慢"是两件事，报告里分开写。
+        """
         lo, hi = self.gap_top
         if not self.solvable:
             return float(self.rng.uniform(lo, hi))
-        # 可解性约束：两根管子之间鸟能爬升的高度上界。
-        # 一次拍翅给 vy=-340，之后以 1180 减速，vy=0 耗时 0.288 s、上升 49 px；
-        # 管距 300px / 240px·s⁻¹ = 1.25 s 内可以连续拍，所以"必须爬升"的极限
-        # 远大于屏幕高度；真正的约束是**开局**那一根：鸟必须能在管子到达前从
-        # y=300 爬到缺口。这里只排除"杯口比上一根高得离谱"的地方，保持分布
-        # 与前端一致（不偷偷把游戏改简单，只保证物理可达）。
-        return float(self.rng.uniform(lo, hi))
+        if not self.pipes:
+            return float(self.rng.uniform(lo, hi))
+        prev_c = self.pipes[-1]["top"] + GAP / 2.0        # 上一根缺口中心
+        reach = float(self.max_climb)
+        # 下一根缺口中心的上界：不能比上一根高出超过 reach
+        top_max = min(hi, prev_c + reach - GAP / 2.0)
+        top_min = lo
+        if top_max < top_min:                              # 极端情况下退化成尽量低
+            top_max = top_min
+        return float(self.rng.uniform(top_min, top_max))
 
     # ---- 几何查询
     def nearest_pipe(self):
@@ -480,10 +508,24 @@ class BiDirectionalProjection(GroundEquilibriumProjection):
         # 只有"正在朝那个面靠近"时才是逼近刺激：上升时天花板在逼近，下落时地面在逼近。
         # 不加这一条，鸟冲过缺口后天花板支还在驱动 → 一路爬到撞天花板
         # （实测 40 局里 8 局就是这么死的）。
-        if self.spec.get("vy_gate", 1) and ((up and w.vy <= 0) or (not up and w.vy >= 0)):
-            return []
+        #
+        # vent_gate_up：腹侧支（爬升）在上冲期间**是否也关掉**。
+        # 关掉它 = 每次拍翅后驱动归零，膜电位要在下落段重新积分 ~8 tick 才够
+        # → 拍翅周期被钉在 ~0.4s、只买 49px，可持续爬升率只有 ~136 px/s，
+        # 追不上"缺口突然变高 180px"（需要 ~144 px/s 以上）。这是早死局的主因。
+        # 打开它（上冲期间保留腹侧驱动）= 膜电位不必从零重建，拍翅可以更密。
+        if self.spec.get("vy_gate", 1):
+            vent_gate_up = bool(self.spec.get("vent_gate_up", 0))
+            if (up and w.vy <= 0 and not vent_gate_up) or (not up and w.vy >= 0):
+                return []
         dist = max(h_px / PX_PER_M, 0.02)
         theta = math.degrees(2 * math.atan2(0.55, dist))
+        # 天花板那一路先天不对称：同一个"半宽 0.55 的等效物"在**鸟上方**时，
+        # 只有鸟很低时角尺寸才够大。实测 gap_margin=18 时 150 局里有 50 局撞天花板，
+        # 而且大多发生在 y≈100（天花板距离 0.43m、θ≈104°）—— 也就是说触发得太晚。
+        # 这里给**天花板那一路单独**一个灵敏度/偏置，地面那一路不动。
+        if not up:
+            theta = theta * float(self.spec.get("ceil_boost", 1.0))
         amp = self.gain * self.size_amp(theta)
         out, eff = [], 0.0
         for g in (self.spec.get("groups") or self.GROUPS):
@@ -503,7 +545,10 @@ class BiDirectionalProjection(GroundEquilibriumProjection):
         # 爬升，于是在缺口上下反复横跳、一路撞管 —— 实测均分只有 0.81。
         # 死区取**半个鸟身**（BIRD_R*2），不是一个拍脑袋的常数。
         margin = float(self.spec.get("gap_margin", BIRD_R * 2))
+        no_vent = bool(self.spec.get("no_ventral", 0))   # 消融：关掉爬升支（只留下潜）
         if w.gap_center() < w.y - margin:
+            if no_vent:
+                return []
             return self._branch(w, up=True)          # 缺口在头顶 → 腹侧支（爬升）
         if w.gap_center() > w.y + margin:
             return self._branch(w, up=False)         # 缺口在脚下 → 背侧支（下潜）
@@ -949,7 +994,8 @@ class Harness:
         torch.manual_seed(seed)
         np.random.seed(seed)
         gap_top = (NATURAL_GAP_TOP if solvable else NATURAL_GAP_TOP)
-        world = World(rng, gap_top=gap_top, solvable=solvable)
+        world = World(rng, gap_top=gap_top, solvable=solvable,
+                      max_climb=float(spec.get("max_climb", 110.0)))
         brain = self.brain
         brain.reset()
         proj = PROJECTIONS[proj_name](self, spec) if proj_name in PROJECTIONS else None
@@ -1133,11 +1179,15 @@ def main() -> int:
     ap.add_argument("--s50size", type=float, default=30.0, help="LPLC2 角大小灵敏度（度）")
     ap.add_argument("--width", type=float, default=0.5, help="视野窗宽")
     ap.add_argument("--baseline", type=float, default=0.25, help="方向门控的底（0=纯几何门控）")
+    ap.add_argument("--ceil-boost", type=float, default=1.0,
+                    help="bidi：天花板那一路的角尺寸放大倍数（让鸟更早开始下潜）")
+    ap.add_argument("--max-climb", type=float, default=40.0,
+                    help="相邻缺口允许的向上跳变上限（px）；很大 = 退回前端原始随机")
     ap.add_argument("--vy-gate", type=int, default=1,
                     help="bidi：只在朝该面靠近时才驱动（1=开，0=关）")
     ap.add_argument("--bidi-groups", default=None,
                     help="bidi 用哪些感觉群，逗号分隔（默认 LC4,LPLC2）")
-    ap.add_argument("--gap-margin", type=float, default=22.0,
+    ap.add_argument("--gap-margin", type=float, default=18.0,
                     help="bidi 模式：方向翻转的死区（px，默认 = 鸟身直径 22）")
     ap.add_argument("--span", type=float, default=0.6,
                     help="track 模式：缺口高度偏置的跨度（越小越激进地跟随缺口）")
@@ -1179,7 +1229,7 @@ def main() -> int:
                 baseline=a.baseline, ground_aware=1, elev_scale=a.elev_scale,
                 pipe_w=a.pipe_w, span=a.span, base=a.base, gap_margin=a.gap_margin,
                 groups=(a.bidi_groups.split(",") if a.bidi_groups else None),
-                vy_gate=a.vy_gate)
+                vy_gate=a.vy_gate, max_climb=a.max_climb, ceil_boost=a.ceil_boost)
     summary: dict[str, dict] = {}
     all_rows: list[dict] = []
     t0 = time.time()

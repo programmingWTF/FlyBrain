@@ -85,25 +85,29 @@ D:/Code/FlyBrain/env/python.exe demo/server.py --asset spiking_full
 
 ## ⚠️ 页面的 Flappy 投射仍是旧的（2026-10-03 说明）
 
-命令行评测台 `scripts/flappy_bench.py` 找到了两个**更好的感觉投射**：
+命令行评测台 `scripts/flappy_bench.py` 已经迭代了三轮（200 局/条件）：
 
-| 投射 | 均分（60 局） | 最高 |
-|---|---|---|
-| 页面当前："最近碰撞 + LC4 角速度" | 1.58 | 5 |
-| 第一轮：腹侧 LPLC2 读地面角尺寸 | 2.03 | 7 |
-| **第二轮：双向逼近反射（腹侧爬升 + 背侧下潜 + 接近速度门控）** | **7.20** | **26** |
+| 投射 | 均分 | 中位 | 最高 | ≤2 分占比 |
+|---|---|---|---|---|
+| 页面当前："最近碰撞 + LC4 角速度" | 1.54 | 1 | 8 | **86%** |
+| 第一轮：腹侧 LPLC2 读地面角尺寸 | 2.44 | 1 | 13 | 70% |
+| 第二轮：双向逼近反射（腹侧爬升 + 背侧下潜 + 接近速度门控） | 7.20 | 5 | 26 | 27% |
+| **第三轮：双向 + 按执行器带宽生成关卡** | **29.52** | **21** | **72** | **19%** |
+| 外部 lookahead 规划器（上限刻度，非策略候选） | 63.83 | 72 | 72 | 0% |
 
-细节见 `ESCAPE.md` §6。页面**还没有**切到新投射，所以浏览器里看到的分数会低于上表。
+细节见 `ESCAPE.md` §6~§8。页面**还没有**切到新投射，所以浏览器里看到的分数会远低于上表。
 要复现报告里的数，请用命令行：
 
 ```bash
 PY=D:/Code/FlyBrain/env/python.exe
-$PY scripts/flappy_bench.py --asset spiking_full --modes baseline,ground_lock,bidi,lookahead \
-    --games 60 --max-ticks 2500 --gap-margin 22 --vy-gate 1
-$PY scripts/flappy_experiments.py --games 60 --max-ticks 2500   # 全套对照一次跑完
+$PY scripts/flappy_bench.py --asset spiking_full \
+    --modes passive,baseline,ground_lock,bidi,lookahead --games 200 --max-ticks 5000
+$PY scripts/flappy_experiments.py --games 60    # 全套对照 + 消融一次跑完
+$PY scripts/flappy_failures.py --games 60       # 失败点分布（为什么会有低分尾部）
 ```
 
-这些都是同一颗冻结脑、零可学参数跑出来的；差别只在**刺激投给哪些细胞**。
+这些都是同一颗冻结脑、零可学参数跑出来的；差别只在**刺激投给哪些细胞**
+以及**关卡的可达性约束**。
 
 ## 已知限制（演示里也写了，别对外夸大）
 
