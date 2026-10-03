@@ -598,7 +598,23 @@ def main() -> int:
     print(f"  可点亮神经元（有解剖坐标的）：{len(sess.lit)}")
 
     H.sess = sess
-    srv = ThreadingHTTPServer((a.host, a.port), H)
+
+    # ⚠️ 两个必须的服务器设置（都是实测踩出来的）：
+    #
+    # 1) `request_queue_size`：socketserver 默认只有 **5**。客户端（网页）以
+    #    ~60 次/秒发 /api/step，而每次脑仿真要 ~10ms（全脑 1502 万突触），
+    #    于是监听队列经常是满的 —— 满的时候连接请求被丢弃/挂起。
+    #    实测：并发 8 个请求，7 个 ~80ms、**1 个卡 4.7 秒**；浏览器里表现为
+    #    fetch 3.7 秒才 settle，inFlight 长期为 true，脑一个 tick 都推不动，
+    #    页面分数停在 0~1（而评测台 111）。这是页面"看起来不聪明"的真正原因。
+    #
+    # 2) `daemon_threads`：否则 Ctrl+C 退出时会等残留连接线程。
+    class _Srv(ThreadingHTTPServer):
+        request_queue_size = 256
+        daemon_threads = True
+        allow_reuse_address = True
+
+    srv = _Srv((a.host, a.port), H)
     url = f"http://{a.host}:{a.port}/"
     print(f"\n✓ 打开 {url}\n  （Ctrl+C 退出）\n")
     if not a.no_browser:

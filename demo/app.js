@@ -15,6 +15,12 @@ const PX_PER_M = 240;              // 世界尺度：1 米 = 240 像素
 const TICK_S = 0.02;               // 脑的时钟：20ms/tick
 const FLAP_COOLDOWN = 0.14;        // 两次拍翅最小间隔（秒）
 
+// 严格模式（?strict=1）：与评测台同构的"脑决策 → 1 步物理"驱动。
+// 用途是**判定页面与评测台的差异到底在时序还是在算法**，不是给玩家用的模式。
+const STRICT = /[?&]strict=1\b/.test(location.search);
+//: 严格模式跑多少个 tick 就停（用于量分）。5000 tick = 100s 游戏时间。
+const STRICT_TICKS = 5000;
+
 const P = { s50: 15, s50size: 30, rad: 0.05, spd: 1.0, need: 1, graph: 'real',
             mode: 'flappy', tmax: 40, show3d: true };
 // ---------------------------------------------------------------- 双向逼近反射
@@ -187,10 +193,11 @@ async function post(path, body) {
 
 let inFlight = false;
 function stepBrain(ticks) {
-  if (inFlight) return false;
+  DBG.sbCalls = (DBG.sbCalls || 0) + 1;      // 排障：被调用次数
+  if (inFlight) { DBG.sbBusy = (DBG.sbBusy || 0) + 1; return false; }
   // Flappy 走双向反射（方向由缺口在视野里的高低决定），不需要"最近碰撞"那套几何。
   const th = (P.mode === 'flappy') ? { bidi: true } : threat();
-  if (!th) return false;
+  if (!th) { DBG.sbNoThreat = (DBG.sbNoThreat || 0) + 1; return false; }
   inFlight = true;
   // 几何量是前端算的（后端只收"每个群发多少"），所以显示要自己留一份
   if (!th.bidi) {
@@ -232,6 +239,7 @@ function stepBrain(ticks) {
     body = bidiBody(th, ticks);
   }
   post('/api/step', body).then(r => {
+    DBG.sbOk = (DBG.sbOk || 0) + 1;
     if (r.error) { $('stat').textContent = '后端错误：' + r.error; return; }
     S.resp = r;
     G.hist.push(r.drive ?? r.drive_max ?? 0);
@@ -248,8 +256,10 @@ function stepBrain(ticks) {
     }
     if (r.dn01_recent > 0) G.dnFlash = 0.2;
   }).catch(e => {
+    DBG.sbErr = (DBG.sbErr || 0) + 1;
+    DBG.sbErrMsg = String(e).slice(0, 120);
     $('stat').textContent = '后端连接断了：' + e;
-  }).finally(() => { inFlight = false; });
+  }).finally(() => { inFlight = false; DBG.sbFin = (DBG.sbFin || 0) + 1; });
   return true;
 }
 
@@ -900,7 +910,11 @@ function initUI() {
 }
 
 // ---------------------------------------------------------------- 主循环
-const DBG = { frames: 0, err: null, lastTs: null, G, P, S };
+// ⚠️ 排障计数器**必须**在这里初始化。
+// 踩过：`DBG.brainTicks++` 在 DBG 没有该字段时是 `undefined++` = **NaN**，
+// 而诊断脚本写的是 `d.brainTicks || 0`，NaN 就被显示成 0 —— 于是看起来像
+// "脑一个 tick 都没推进"，我照着这个假象查了很久的时序和服务器队列问题。
+const DBG = { frames: 0, brainTicks: 0, err: null, lastTs: null, G, P, S };
 window.__dbg = DBG;                 // 排障用：控制台读 __dbg.frames / __dbg.err
 window.G = G;                       // 排障用：控制台看当前分数 / 死因
 const PERF = { f: 0, last: 0, fps: 0 };
@@ -917,22 +931,35 @@ function loop(ts) {
     const now = ts / 1000;
     const dt = G.last ? Math.min(0.05, now - G.last) : 0;
     G.last = now;
-    physics(dt);
-    G.acc = Math.min(G.acc + dt, 0.3);      // 卡住时不要攒出一大坨补帧
-    // 只有请求真的发出去了才消耗累积的 tick。之前是先减后发、
-    // 而 stepBrain 可能因上一请求未完成直接 return -> 那些 tick 被丢掉，
-    // 脑就长期跑不满实时（实测只剩 24%）。
-    const ticks = Math.floor(G.acc / TICK_S);
-    // ⚠️ 一次只喂**一个** tick。
+
+    // ---- 严格模式（?strict=1）：与评测台同构 —— "脑决策之后走恰好 1 步物理"。
     //
-    // 原来这里是 `stepBrain(Math.min(ticks, 12))` —— 脑一次请求可能带回 3~4 个 tick
-    // （实测 39.6 tick/s，而物理按墙钟 60 步/s，累积后就是 3~4），而 physics(dt) 用的
-    // 是**墙上 dt**，于是这几步物理在同一帧里被一次性补完：鸟在两次脑决策之间"瞬移"
-    // 3~4 个 tick，反射拿到的视觉输入滞后 3~4 tick → 系统性过冲。
-    // 实测页面因此只能拿 1~4 分，而评测台（严格 1 tick ↔ 1 物理步）是 111 分。
-    // 改成每次只发 1 tick，物理也就只走 1 步，与评测台对齐；脑跟不上时游戏整体变慢
-    // （这是正确行为：鸟不会偷偷变重、反射也不会拿到过期的画面）。
-    if (ticks > 0 && stepBrain(1)) G.acc -= TICK_S;
+    // 为什么需要这个开关：页面实测 1~4 分、评测台 111 分，差两个数量级。
+    // 而 `scripts/flappy_page_parity.py` 号称验证过两边一致 —— 但它其实是
+    // `class PageWorld(fb.World)`，**继承了评测台**，比的是评测台自己。
+    // 所以"页面算法是否等价"从来没被真正验证过。这个开关就是那个对照：
+    //   开了还低分 → 算法本身与评测台不等价（真 bug，去查算法）
+    //   开了就正常 → 只是墙钟时序问题（去改时序）
+    if (STRICT) {
+      if (G.t < STRICT_TICKS * TICK_S) {
+        if (!brainBusy() && stepBrain(1)) { DBG.brainTicks++; physics(TICK_S); }
+      } else if (!DBG.strictDone) {
+        DBG.strictDone = true;
+        DBG.strictScore = G.score;
+        DBG.strictCause = G.cause || '存活到上限';
+      }
+    } else {
+      // 固定步长：物理按"脑 tick 数"推进，不按墙上时钟。
+      // 原来 `physics(dt)` 用墙上 dt，而脑每帧最多 1 tick → 物理 1.24 步 : 脑 1 tick，
+      // 同样的脑 tick 数下鸟多落 24%、拍翅相对弱 24%。
+      const ticks = Math.floor((G.acc = Math.min(G.acc + dt, 0.3)) / TICK_S);
+      if (ticks > 0 && stepBrain(1)) {
+        G.acc -= TICK_S; DBG.brainTicks++;
+        physics(TICK_S);
+      } else if (ticks === 0) {
+        physics(TICK_S);          // 不足一个 tick 也给一帧物理，保持画面连续
+      }
+    }
     // 排障遥测：每 ~0.5s 记一行
     if (PERF && (ts - (DBG.telTs || 0)) > 500) {
       DBG.telTs = ts;
