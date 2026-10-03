@@ -66,6 +66,22 @@ const G = {
   resp: null, hist: [], flashT: 0, dnFlash: 0,
 };
 const GRAV = 1180, FLAP_V = -340, PIPE_W = 62, GAP = 168;
+//: 管子间距（px）。**按距离**生成，不按"上一根在哪"—— 物理子步数变化时后者会漏生成
+//: （没管子 = 没逼近刺激 = 反射不触发，看起来像脑子的错）。与评测台 SPACING 一致。
+const SPACING = 300;
+//: 碰撞判定用的鸟半径（px）。physics() 的判据是
+//:   `G.y - BIRD_R < p.top || G.y + BIRD_R > p.top + GAP`
+//: 即"判定体积 = 鸟中心 ± BIRD_R"。它必须与**画出来的鸟**一致，否则就会出现
+//: "看着碰到管子却不判定失败"。`demo/verify_bird_volume.js` 逐形状量着守它。
+const BIRD_R = 11;
+//: 鸟精灵的最大旋转角（弧度）。原先是 vy/430 夹到 [-0.55, 1.10]，但旋转会让精灵的
+//: 外接范围明显变大（实测竖直到 23.2px），远超判定半径 11px。收紧后外接约 13.7px，
+//: 再乘 SPRITE_SCALE 就能完整装进判定体积。
+const SPRITE_ROT_MAX = 0.30;
+//: 精灵整体缩放。**由 verify_bird_volume.js 量出来的**：原始外接半径上界
+//: 15.06px（翅膀展开那一相位撑出来的）÷ BIRD_R(11) → 应 ≤ 0.730，取 0.715 留余量。
+//: 缩放后外接约 10.8px ≤ 11px。改了精灵形状或旋转上限就让校验器重算这个数。
+const SPRITE_SCALE = 0.715;
 
 /** 双向逼近反射的"望远镜几何"：只算纯几何量，交给后端决定驱动哪些细胞。
  *
@@ -147,6 +163,8 @@ function resetGame() {
   G.started = false; G.readyT = performance.now();
   G.y = 300; G.vy = 0; G.pipes = []; G.dead = false;
   G.deadT = 0; G.acc = 0; G.cooldown = 0; G.spawnT = 0; G.hist = [];
+  G.pend = 0;              // 清掉积压的物理步，否则重开后鸟会先"冲"一段
+  G.spawnAcc = 0;
   // 每一局都要归零。之前一次改动把这行弄丢了，导致撞死后分数跨局累加、
   // "最高"也跟着变成累计值 —— 看起来就是得分算错。
   G.score = 0;
@@ -441,21 +459,37 @@ function drawGround(g) {
   }
 }
 
+/** 鸟精灵的旋转角 = f(竖直速度)。**画图与体积校验共用这一个函数**，避免两处漂移。 */
+function birdRot(vy) {
+  return Math.max(-SPRITE_ROT_MAX, Math.min(SPRITE_ROT_MAX, vy / 430));
+}
+
+/** 画鸟。**所有形状都落在半径 BIRD_R 的圆内** —— 这是"看着碰到就一定判定到"的前提。
+ *
+ *  原实现（椭圆 17×13 + 随速度旋转 ±0.55/1.10 + 翅膀/眼睛/喙 到 x=25）实测外接
+ *  竖直 23.2px、水平 25.0px，而判定半径只有 11px：下落时精灵压进管子 12px 都还算
+ *  "没碰到"。用户报的"看着碰到了却不失败"就是这个。
+ *
+ *  改法不是把整只鸟缩小（那样要 0.44 倍，小得没法看），而是重新排布：
+ *  局部坐标下所有形状的 |x|、|y| 都 ≤ 13，SPRITE_ROT_MAX 下旋转后的外接半径
+ *  ≤ 13.7，乘 SPRITE_SCALE(0.802) 后 ≤ 11 —— 与判定体积一致。
+ *  翼展和喙都保留，只是不再探出判定范围。
+ *  `demo/verify_bird_volume.js` 把这些形状变换到世界坐标后逐条核对。 */
 function drawBirdSprite(g) {
-  const r = Math.max(-0.55, Math.min(1.1, G.vy / 430));
-  g.save(); g.translate(G.birdX, G.y); g.rotate(r);
+  g.save(); g.translate(G.birdX, G.y); g.rotate(birdRot(G.vy)); g.scale(SPRITE_SCALE, SPRITE_SCALE);
   g.fillStyle = '#f7d51d'; g.strokeStyle = '#5c4708'; g.lineWidth = 2;
-  g.beginPath(); g.ellipse(0, 0, 17, 13, 0, 0, 7); g.fill(); g.stroke();
-  g.fillStyle = '#fdf3c0'; g.beginPath(); g.ellipse(-2, 5, 11, 6, 0, 0, 7); g.fill();
-  // 翅膀：三相位扇动
-  const ph = [0.9, 0.1, -0.7][G.wingPhase];
-  g.save(); g.translate(-4, -1); g.rotate(ph);
+  g.beginPath(); g.ellipse(0, 0, 13, 10, 0, 0, 7); g.fill(); g.stroke();
+  g.fillStyle = '#fdf3c0'; g.beginPath(); g.ellipse(-1.5, 3, 8, 4.5, 0, 0, 7); g.fill();
+  // 翅膀：三相位扇动（扇动半径也让它在判定圆内）
+  const ph = [0.55, 0.1, -0.45][G.wingPhase];
+  g.save(); g.translate(-3, -1); g.rotate(ph);
   g.fillStyle = '#f0a81c'; g.strokeStyle = '#5c4708';
-  g.beginPath(); g.ellipse(-6, 0, 10, 6, 0, 0, 7); g.fill(); g.stroke(); g.restore();
-  g.fillStyle = '#fff'; g.beginPath(); g.arc(8, -4, 5.5, 0, 7); g.fill();
-  g.fillStyle = '#222'; g.beginPath(); g.arc(9.5, -4, 2.4, 0, 7); g.fill();
+  g.beginPath(); g.ellipse(-5, 0, 7, 4.5, 0, 0, 7); g.fill(); g.stroke(); g.restore();
+  g.fillStyle = '#fff'; g.beginPath(); g.arc(6, -3, 4, 0, 7); g.fill();
+  g.fillStyle = '#222'; g.beginPath(); g.arc(7, -3, 1.8, 0, 7); g.fill();
+  // 喙：尖端在 x=12.5（乘 0.802 后 ≈ 10.0 < BIRD_R），不再探出判定范围
   g.fillStyle = '#f07f18'; g.strokeStyle = '#a4530b'; g.lineWidth = 1.5;
-  g.beginPath(); g.moveTo(14, -1); g.lineTo(25, 2); g.lineTo(14, 6); g.closePath();
+  g.beginPath(); g.moveTo(9, -1.5); g.lineTo(12.5, 0.5); g.lineTo(9, 3); g.closePath();
   g.fill(); g.stroke();
   g.restore();
 }
@@ -972,11 +1006,19 @@ function loop(ts) {
       if (ticks > 0 && stepBrain(FLAPPY.batch)) {
         const n = Math.min(ticks, FLAPPY.batch);
         G.acc -= n * TICK_S; DBG.brainTicks += n;
-        for (let i = 0; i < n; i++) physics(TICK_S);
+        // ⚠️ 不在这里一口气走完 n 步物理，而是**排队分帧走**。
+        //
+        // 为什么：一帧走 4 步、下一帧走 0 步，画面就是一卡一卡（用户报的抖动）。
+        // 分帧走不改变任何物理结果 —— 同样的步数、同样的拍翅决策、同样的顺序，
+        // 只是把冲量摊到后续帧，所以判定与评测台仍逐 tick 一致，
+        // 而鸟的位置在屏幕上连续移动。
+        G.pend = Math.min(64, (G.pend || 0) + n);
       } else if (ticks === 0) {
         physics(TICK_S);          // 不足一个 tick 也给一帧物理，保持画面连续
       }
     }
+    // 把积压的物理步按帧消化（每帧最多 1 步，避免一帧跳一大段）
+    if (G.pend > 0 && !STRICT) { physics(TICK_S); G.pend--; }
     // 排障遥测：每 ~0.5s 记一行
     if (PERF && (ts - (DBG.telTs || 0)) > 500) {
       DBG.telTs = ts;
@@ -989,6 +1031,7 @@ function loop(ts) {
       });
       if (DBG.tel.length > 120) DBG.tel.shift();
     }
+    // 物理步已经在上面按帧消化（G.pend），这里只负责画。
     drawGame(); drawScope();
     if (P.show3d) draw3D();
     hud();
