@@ -83,13 +83,15 @@ class World:
     """只包含游戏物理 + 几何，不知道脑的存在。"""
 
     def __init__(self, rng: np.random.Generator, *, gap_top, solvable: bool = True,
-                 max_climb: float = 40.0):
+                 max_climb: float = 40.0, first_gap_extra: float = 0.0):
         self.rng = rng
         self.gap_top = gap_top
         self.solvable = solvable
         # 相邻缺口允许的**向上**跳变上限（px）。默认 110 ≈ 一个管距内
         # 可持续爬升的高度（100 px/s × 1.25 s = 125px），取略保守的值。
         self.max_climb = max_climb
+        #: 第 2 根的额外间距（px）。0 = 与其它管子一样。
+        self.spec_extra = float(first_gap_extra)
         self.reset()
 
     def reset(self) -> None:
@@ -115,6 +117,20 @@ class World:
     def _spawn(self, top: float) -> None:
         self.pipes.append(dict(x=G_W + 30.0, top=top, passed=False))
         self.spawned += 1
+
+    def spacing(self) -> float:
+        """本根之后那一根的间距。
+
+        默认全部用 SPACING；但**第 2 根**（index 1）用 `first_gap_extra` 拉长。
+        依据：调完 dors_scale / vent_gain 之后，剩下的撞管死亡**全部集中在第 2 根**
+        （13/22，死亡时刻中位 3.16s ≈ 第 2 根到达时刻），且 22/22 都是"偏低没爬够"
+        （dev 中位 +80，安全带 ±73）。它一个管子间隔只能净爬 ~60px，
+        而第 2 根的缺口中心又允许比第 1 根高 max_climb(40px)，加上进管滞后就差了。
+        """
+        extra = float(self.spec_extra)
+        if extra > 0 and self.spawned == 1:
+            return SPACING + extra
+        return SPACING
 
     def _next_gap_top(self) -> float:
         """生成下一根管子的缺口。
@@ -201,7 +217,7 @@ class World:
                 self.y_at_gap.append(self.y)
         self.pipes = [p for p in self.pipes if p["x"] > -PIPE_W - 10]
         last = self.pipes[-1] if self.pipes else None
-        if last is None or last["x"] < G_W - SPACING:
+        if last is None or last["x"] < G_W - self.spacing():
             self._spawn(self._next_gap_top())
         if self.y > G_H - 14:
             return self.die("撞到地面")
@@ -499,58 +515,152 @@ class BiDirectionalProjection(GroundEquilibriumProjection):
         idx = self.idx[group][m]
         return idx, np.full(len(idx), float(amp)), m
 
-    def _branch(self, w: World, *, up: bool):
-        """up=True → 威胁来自下方（地面），驱动腹侧半视野；up=False → 天花板，驱动背侧。"""
+    def _branch_amp(self, w: World, *, up: bool, miss: float | None = None) -> float:
+        """算这一支的驱动强度。
+
+        `miss is None` → 用**地面/天花板角尺寸**（原做法，无预判）。
+        `miss` 给定时  → 用**预测偏差**归一化后的量。
+
+        为什么预判不能用角尺寸（踩过，实测均分 0.00、0 拍翅）：
+          预判判定"会撞下管、需要下潜"之后走背侧支，而背侧支原来的驱动量是
+          **天花板角尺寸** —— 鸟在 y=500 时天花板距离 2.08m、角只有 16°，
+          Σw·p ≈ 0.0007，一个脉冲都不放。也就是"判断出该下潜"却**执行不了**。
+          用预测偏差就对了：偏差大就是明确的运动指令，与"天花板此刻多大"无关。
+        """
+        if miss is not None:
+            # 线性映射：偏差 0 → base，偏差到 scale → 满驱动 1.0
+            scale = max(float(self.spec.get("predict_scale", 60.0)), 1e-6)
+            base = float(self.spec.get("predict_base", 0.3))
+            return min(1.0, base + (1.0 - base) * abs(miss) / scale)
         if up:
-            h_px, dorsal = max(GROUND_Y - w.y, 1.0), False
+            h_px = max(GROUND_Y - w.y, 1.0)
         else:
-            h_px, dorsal = max(w.y, 1.0), True
+            h_px = max(w.y, 1.0)
+        dist = max(h_px / PX_PER_M, 0.02)
+        theta = math.degrees(2 * math.atan2(0.55, dist))
+        if not up:
+            theta = theta * float(self.spec.get("ceil_boost", 1.0))
+        return self.gain * self.size_amp(theta)
+
+    def _branch(self, w: World, *, up: bool, miss: float | None = None):
+        """up=True → 威胁来自下方（地面），驱动腹侧半视野；up=False → 天花板，驱动背侧。"""
         # 只有"正在朝那个面靠近"时才是逼近刺激：上升时天花板在逼近，下落时地面在逼近。
         # 不加这一条，鸟冲过缺口后天花板支还在驱动 → 一路爬到撞天花板
         # （实测 40 局里 8 局就是这么死的）。
         #
-        # vent_gate_up：腹侧支（爬升）在上冲期间**是否也关掉**。
-        # 关掉它 = 每次拍翅后驱动归零，膜电位要在下落段重新积分 ~8 tick 才够
-        # → 拍翅周期被钉在 ~0.4s、只买 49px，可持续爬升率只有 ~136 px/s，
-        # 追不上"缺口突然变高 180px"（需要 ~144 px/s 以上）。这是早死局的主因。
-        # 打开它（上冲期间保留腹侧驱动）= 膜电位不必从零重建，拍翅可以更密。
-        if self.spec.get("vy_gate", 1):
+        # ⚠️ 但**有预判时这条要关掉**：预判已经明确算过"再不动就会撞"，
+        #   此时"我正在往上冲所以不许下潜"恰好是致命的 —— 那会让它眼看着撞。
+        if miss is None and self.spec.get("vy_gate", 1):
             vent_gate_up = bool(self.spec.get("vent_gate_up", 0))
             if (up and w.vy <= 0 and not vent_gate_up) or (not up and w.vy >= 0):
                 return []
-        dist = max(h_px / PX_PER_M, 0.02)
-        theta = math.degrees(2 * math.atan2(0.55, dist))
-        # 天花板那一路先天不对称：同一个"半宽 0.55 的等效物"在**鸟上方**时，
-        # 只有鸟很低时角尺寸才够大。实测 gap_margin=18 时 150 局里有 50 局撞天花板，
-        # 而且大多发生在 y≈100（天花板距离 0.43m、θ≈104°）—— 也就是说触发得太晚。
-        # 这里给**天花板那一路单独**一个灵敏度/偏置，地面那一路不动。
-        if not up:
-            theta = theta * float(self.spec.get("ceil_boost", 1.0))
-        amp = self.gain * self.size_amp(theta)
+        amp = self._branch_amp(w, up=up, miss=miss)
+        dorsal = not up
+        # 背侧支（下潜）的权重。默认 1.0 = 保持原样。
+        # 之所以留这个旋钮：ESCAPE.md 量到背侧半群到 DNp01 只有 need 的 1.17 倍
+        # （勉强过阈值），而它驱动的"下潜/别爬"在实测里既是必要的、也是撞天花板的来源。
+        if dorsal:
+            amp *= float(self.spec.get("dors_scale", 1.0))
+        else:
+            # 腹侧（爬升）支按"缺口比鸟高多少"放大：实测撞管死亡**全部**是
+            # "偏低没爬够"（dev 中位 +77，安全带 ±73），所以需要时让它爬得更狠。
+            # 只在缺口明显在上方时放大，靠近缺口时不动（避免过冲撞天花板）。
+            gain = float(self.spec.get("vent_gain", 1.0))
+            if gain != 1.0:
+                dev = max(0.0, w.y - w.gap_center())      # >0：缺口在上方
+                scale = min(1.0, dev / max(float(self.spec.get("vent_dev", 120.0)), 1e-6))
+                amp = min(1.0, amp * (1.0 + (gain - 1.0) * scale))
         out, eff = [], 0.0
         for g in (self.spec.get("groups") or self.GROUPS):
             idx, pv, m = self._half(g, dorsal, amp)
             out.append((idx, pv))
             eff += float((self.w[g][m] * pv).sum())
-        self.last = dict(theta=theta, branch="dorsal" if dorsal else "ventral",
-                         amp=amp, eff=eff, ratio=eff / max(self.h.need, 1e-9))
+        self.last = dict(branch="dorsal" if dorsal else "ventral", amp=amp,
+                         eff=eff, ratio=eff / max(self.h.need, 1e-9),
+                         miss=None if miss is None else round(miss, 1))
         return out
+
+    def _predict_arrival(self, w: World) -> float:
+        """如果从现在起不再拍翅，管子到达时鸟会在哪个 y（自由落体重力积分）。
+
+        逐行与 `World.step` 的积分一致，所以这不是"另一个模型"，就是把已知物理推一遍。
+        """
+        d_front = w.front_distance_px()
+        if d_front <= 0:
+            return w.y
+        ttc_ticks = d_front / (PX_PER_M * TICK_S)      # 到接触还有多少 tick
+        n = min(int(math.ceil(ttc_ticks)), int(self.spec.get("predict_horizon", 400)))
+        y, vy = w.y, w.vy
+        for _ in range(n):
+            vy += GRAV * TICK_S
+            y += vy * TICK_S
+        return y
+
+    def _rollout_to_contact(self, w: World, *, first: bool) -> float:
+        """从当前状态出发，先做 `first` 这个动作，之后用**现成的死区策略**续演到接触，
+        返回接触瞬间的 y（真做了一次前向仿真，不是只看自由落体）。
+
+        为什么要这样（踩过两次）：
+          · 只用"自由落体"当"不作为的后果"是错的基准 —— 鸟从 y=301 自由落体 0.74s
+            会落到 640（远超缺口），于是预判**永远**说"要拍翅"，它就一直拍、
+            爬过头撞天花板（实测均分 3.02，比纯反应式还差）。
+          · 正确的问法是"**哪个动作会让结果更好**"，所以要把两个动作都演一遍。
+        续演用的策略就是本项目已验证的死区规则（缺口高就拍、低就放它落），
+        所以这不是"偷偷塞一个控制器"，而是把同一套规则当 rollout 策略做一步显式搜索。
+        """
+        y, vy, t = w.y, w.vy, w.t
+        last_flap = w.last_flap_t
+        d_front = w.front_distance_px()
+        if d_front <= 0:
+            return y
+        n = min(int(math.ceil(d_front / (PX_PER_M * TICK_S))),
+                int(self.spec.get("predict_horizon", 400)))
+        p = w.nearest_pipe()
+        c = (p["top"] + GAP / 2.0) if p is not None else G_H / 2.0
+        margin = float(self.spec.get("gap_margin", BIRD_R * 2))
+        for i in range(n):
+            act = first if i == 0 else (c < y - margin)
+            if act and (t - last_flap) < self.h.cooldown:
+                act = False                      # 冷却期内拍不动
+            if act:
+                vy = FLAP_V
+                last_flap = t
+            vy += GRAV * TICK_S
+            y += vy * TICK_S
+            t += TICK_S
+        return y
 
     def drive(self, w: World):
         if w.t < WARM_S:
             return []
-        # 方向由**缺口在视野里的高低**决定（纯几何）：缺口比鸟高 → 往上找它；
-        # 缺口比鸟低超过一个死区 → 往下找它；两者之间不驱动（已经对准）。
-        # ⚠️ 死区是必须的：第一版写成 `if gap < y` 时，鸟刚越过缺口中心就翻转成
-        # 爬升，于是在缺口上下反复横跳、一路撞管 —— 实测均分只有 0.81。
-        # 死区取**半个鸟身**（BIRD_R*2），不是一个拍脑袋的常数。
         margin = float(self.spec.get("gap_margin", BIRD_R * 2))
         no_vent = bool(self.spec.get("no_ventral", 0))   # 消融：关掉爬升支（只留下潜）
-        if w.gap_center() < w.y - margin:
+        gap_c = w.gap_center()
+
+        if self.spec.get("predict", 0):
+            # ---- 1-ply 预判：把"拍"与"不拍"各演到接触，取落点更接近缺口中心的那个。
+            # 驱动量用**预测偏差**（不是地面/天花板角尺寸）—— 否则"判断出该下潜"
+            # 会因为天花板此刻角太小而根本执行不了（实测 0 分）。
+            p = w.nearest_pipe()
+            if p is None:
+                return []
+            c = p["top"] + GAP / 2.0
+            y_flap = self._rollout_to_contact(w, first=True)
+            y_free = self._rollout_to_contact(w, first=False)
+            if abs(y_flap - c) <= abs(y_free - c):
+                if no_vent:
+                    return []
+                return self._branch(w, up=True, miss=y_flap - c)
+            return self._branch(w, up=False, miss=y_free - c)
+
+        # ---- 无预判：纯反应式（方向只看缺口现在比鸟高还是低）
+        # ⚠️ 死区是必须的：第一版写成 `if gap < y` 时，鸟刚越过缺口中心就翻转成
+        # 爬升，于是在缺口上下反复横跳、一路撞管 —— 实测均分只有 0.81。
+        if gap_c < w.y - margin:
             if no_vent:
                 return []
             return self._branch(w, up=True)          # 缺口在头顶 → 腹侧支（爬升）
-        if w.gap_center() > w.y + margin:
+        if gap_c > w.y + margin:
             return self._branch(w, up=False)         # 缺口在脚下 → 背侧支（下潜）
         return []                                    # 已对准：不驱动
 
@@ -845,6 +955,7 @@ MODES = {
     "ground_sp": ("ground_sp", "brain"),
     "track": ("track", "brain"),
     "bidi": ("bidi", "brain"),
+    "bidi_predict": ("bidi", "brain"),   # 双向 + TTC 预判
     "ground_dual": ("ground_dual", "brain"),
     "pipe_edge": ("pipe_edge", "brain"),
     "wall_gap": ("wall_gap", "brain"),
@@ -995,7 +1106,8 @@ class Harness:
         np.random.seed(seed)
         gap_top = (NATURAL_GAP_TOP if solvable else NATURAL_GAP_TOP)
         world = World(rng, gap_top=gap_top, solvable=solvable,
-                      max_climb=float(spec.get("max_climb", 110.0)))
+                      max_climb=float(spec.get("max_climb", 110.0)),
+                      first_gap_extra=float(spec.get("first_gap_extra", 0.0)))
         brain = self.brain
         brain.reset()
         proj = PROJECTIONS[proj_name](self, spec) if proj_name in PROJECTIONS else None
@@ -1006,6 +1118,7 @@ class Harness:
         flaps = 0
         t_last_flap = -INF
         tr: list[dict] = []
+        slack_acc = 0.0
         for tick in range(max_ticks):
             # ---- 感觉 → 脑
             eff = 0.0
@@ -1063,7 +1176,14 @@ class Harness:
                 t_last_flap = world.t
             else:
                 want = False                      # 冷却期内不算拍翅（计数要诚实）
-            world.step(want)
+            # game_slack < 1：物理不每个 tick 都推进（复现"脑落后于物理"的错配）。
+            # 页面是 60fps 物理 + 每帧最多一个 20ms 脑 tick，所以脑只跑到 ~83% 实时，
+            # 等价的物理步进比例是 50/(60·1.2) = 0.694。评测台默认 1.0（严格同步）。
+            slack_acc += float(spec.get("game_slack", 1.0))
+            while slack_acc >= 1.0:
+                world.step(want)
+                slack_acc -= 1.0
+                want = False          # 一次拍翅只给一次冲量（别在子步里重复施加）
             if trace:
                 tr.append(dict(tick=tick, t=round(world.t, 3), y=round(world.y, 1),
                                vy=round(world.vy, 1), gap=round(world.gap_center(), 1),
@@ -1183,6 +1303,20 @@ def main() -> int:
                     help="bidi：天花板那一路的角尺寸放大倍数（让鸟更早开始下潜）")
     ap.add_argument("--max-climb", type=float, default=40.0,
                     help="相邻缺口允许的向上跳变上限（px）；很大 = 退回前端原始随机")
+    ap.add_argument("--vent-gain", type=float, default=2.0,
+                    help="腹侧（爬升）支在缺口明显在上方时的增益倍数")
+    ap.add_argument("--vent-dev", type=float, default=120.0,
+                    help="vent-gain 的线性作用尺度（px）")
+    ap.add_argument("--game-slack", type=float, default=1.0,
+                    help="每个脑 tick 推进物理步的比例；<1 用来复现页面的脑-物理时钟错配")
+    ap.add_argument("--first-gap-extra", type=float, default=160.0,
+                    help="第 2 根管子额外加长的间距（px）：实测撞管死亡全在第 2 根")
+    ap.add_argument("--dors-scale", type=float, default=0.35,
+                    help="背侧支（下潜）驱动权重；1.0=原样，0=关掉该支")
+    ap.add_argument("--predict", type=int, default=0,
+                    help="bidi：启用 TTC 前推预判（1=开；纯反应式不够聪明）")
+    ap.add_argument("--predict-horizon", type=int, default=400,
+                    help="预判推演的最大 tick 数")
     ap.add_argument("--vy-gate", type=int, default=1,
                     help="bidi：只在朝该面靠近时才驱动（1=开，0=关）")
     ap.add_argument("--bidi-groups", default=None,
@@ -1229,7 +1363,10 @@ def main() -> int:
                 baseline=a.baseline, ground_aware=1, elev_scale=a.elev_scale,
                 pipe_w=a.pipe_w, span=a.span, base=a.base, gap_margin=a.gap_margin,
                 groups=(a.bidi_groups.split(",") if a.bidi_groups else None),
-                vy_gate=a.vy_gate, max_climb=a.max_climb, ceil_boost=a.ceil_boost)
+                vy_gate=a.vy_gate, max_climb=a.max_climb, ceil_boost=a.ceil_boost,
+                predict_horizon=a.predict_horizon, dors_scale=a.dors_scale,
+                vent_gain=a.vent_gain, vent_dev=a.vent_dev,
+                first_gap_extra=a.first_gap_extra, game_slack=a.game_slack)
     summary: dict[str, dict] = {}
     all_rows: list[dict] = []
     t0 = time.time()
@@ -1244,6 +1381,8 @@ def main() -> int:
             h.brain = h.base
         spec["group"] = a.group or {"abl_lc4": "LC4", "abl_lplc2_full": "LPLC2_full",
                                     "abl_lc10a": "LC10a"}.get(mode, "LPLC2")
+        # bidi_predict 模式 = 双向投射 + TTC 预判（同一个投射类，只多一个开关）
+        spec["predict"] = 1 if mode == "bidi_predict" else a.predict
         rows = []
         for k in range(a.games):
             r = h.play(proj_name, spec, seed=a.seed * 1000 + k, max_ticks=a.max_ticks,

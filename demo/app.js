@@ -30,7 +30,13 @@ const P = { s50: 15, s50size: 30, rad: 0.05, spd: 1.0, need: 1, graph: 'real',
 // 管距 1.25s 只能爬 ~125px，而缺口的随机跳变有 330px 量程 ——
 // 超出这个带宽的关卡在给定物理下无论如何都飞不进去。
 const FLAPPY = { maxClimb: 40, gapMargin: 18, vyGate: 1, ceilBoost: 1.0,
-                 groups: ['LC4', 'LPLC2'], s50size: 30, n: 3 };
+                 groups: ['LC4', 'LPLC2'], s50size: 30, n: 3,
+                 // 本轮调出的两个旋钮（**外部介入**，不是连接组事实）：
+                 //   dorsScale=0.35：背侧（下潜）支按 0.35 缩 —— 它会把鸟推去撞天花板；
+                 //                   实测越强越差（1.0 时 80 局里 24 局撞天花板）
+                 //   ventGain=2.0 ：缺口明显在上方时放大腹侧（爬升）驱动 ——
+                 //                   撞管死亡 100% 是"偏低没爬够"
+                 dorsScale: 0.35, ventGain: 2.0, ventDev: 120 };
 const S = { info: null, coords: null, ready: false };
 
 // ---------------------------------------------------------------- 游戏状态
@@ -67,7 +73,9 @@ function bidiBody(th, ticks) {
            drives: [{ type: 'bidi', y: G.y, vy: G.vy, gap: gapC,
                       ground_y: G.H - GROUND, s50size: s50, n: n,
                       gap_margin: FLAPPY.gapMargin, vy_gate: FLAPPY.vyGate,
-                      ceil_boost: FLAPPY.ceilBoost, groups: FLAPPY.groups }] };
+                      ceil_boost: FLAPPY.ceilBoost, groups: FLAPPY.groups,
+                      dors_scale: FLAPPY.dorsScale, vent_gain: FLAPPY.ventGain,
+                      vent_dev: FLAPPY.ventDev }] };
 }
 
 /** 当前威胁的几何：返回 {distM, speed, radius} 或 null。
@@ -146,15 +154,26 @@ function resetGame() {
  */
 function spawnPipe() {
   const lo = 70, hi = G.H - GAP - 150;          // 与原来同一个分布范围
-  let gapTop = lo + Math.random() * (hi - lo);
   const last = G.pipes[G.pipes.length - 1];
-  if (last) {
+  let gapTop, x;
+  if (!last) {
+    // ⚠️ 第 1 根必须**和评测台逐字一致**：top=250（缺口中心 334），
+    // 而且开局就在 x = birdX + 0.75*PX_PER_M - PIPE_W = 238，
+    // 不是生成在屏幕右缘（550）等 5.2 秒才到。
+    //
+    // 原来这里是"随机 gapTop + 生成在右缘"。随机让缺口中心可能远在鸟上方
+    // （中心 154~386 vs 鸟起始 300），而 ventGain=2.0 会为追它猛爬、
+    // 冲过缺口后拉不回来 —— 实测页面 100% 死在管 1/管 2（死亡 y 都在 190~232，
+    // 即"爬过头"）。评测台用固定 250，开局是"鸟比缺口中心高 34px"这种温和局面。
+    gapTop = 250;
+    x = G.birdX + 0.75 * PX_PER_M - PIPE_W;
+  } else {
     const prevC = last.top + GAP / 2;           // 上一根缺口中心
     const topMax = Math.min(hi, prevC + FLAPPY.maxClimb - GAP / 2);
-    if (topMax > lo) gapTop = lo + Math.random() * (topMax - lo);
-    else gapTop = lo;
+    gapTop = topMax > lo ? lo + Math.random() * (topMax - lo) : lo;
+    x = G.W + 30;
   }
-  G.pipes.push({ x: G.W + 30, top: gapTop, passed: false });
+  G.pipes.push({ x, top: gapTop, passed: false });
 }
 
 // ---------------------------------------------------------------- 后端通信
@@ -883,6 +902,7 @@ function initUI() {
 // ---------------------------------------------------------------- 主循环
 const DBG = { frames: 0, err: null, lastTs: null, G, P, S };
 window.__dbg = DBG;                 // 排障用：控制台读 __dbg.frames / __dbg.err
+window.G = G;                       // 排障用：控制台看当前分数 / 死因
 const PERF = { f: 0, last: 0, fps: 0 };
 function loop(ts) {
   requestAnimationFrame(loop);
@@ -903,7 +923,28 @@ function loop(ts) {
     // 而 stepBrain 可能因上一请求未完成直接 return -> 那些 tick 被丢掉，
     // 脑就长期跑不满实时（实测只剩 24%）。
     const ticks = Math.floor(G.acc / TICK_S);
-    if (ticks > 0 && stepBrain(Math.min(ticks, 12))) G.acc -= ticks * TICK_S;
+    // ⚠️ 一次只喂**一个** tick。
+    //
+    // 原来这里是 `stepBrain(Math.min(ticks, 12))` —— 脑一次请求可能带回 3~4 个 tick
+    // （实测 39.6 tick/s，而物理按墙钟 60 步/s，累积后就是 3~4），而 physics(dt) 用的
+    // 是**墙上 dt**，于是这几步物理在同一帧里被一次性补完：鸟在两次脑决策之间"瞬移"
+    // 3~4 个 tick，反射拿到的视觉输入滞后 3~4 tick → 系统性过冲。
+    // 实测页面因此只能拿 1~4 分，而评测台（严格 1 tick ↔ 1 物理步）是 111 分。
+    // 改成每次只发 1 tick，物理也就只走 1 步，与评测台对齐；脑跟不上时游戏整体变慢
+    // （这是正确行为：鸟不会偷偷变重、反射也不会拿到过期的画面）。
+    if (ticks > 0 && stepBrain(1)) G.acc -= TICK_S;
+    // 排障遥测：每 ~0.5s 记一行
+    if (PERF && (ts - (DBG.telTs || 0)) > 500) {
+      DBG.telTs = ts;
+      const np = nearestPipe();
+      (DBG.tel = DBG.tel || []).push({
+        t: +(G.t || 0).toFixed(2), sc: G.score, y: Math.round(G.y),
+        vy: Math.round(G.vy), gapC: np ? Math.round(np.top + GAP / 2) : null,
+        px: np ? Math.round(np.x) : null, np: G.pipes.length,
+        br: (G.geo && G.geo.branch) || (DBG.lastBranch || '-'), dead: G.dead,
+      });
+      if (DBG.tel.length > 120) DBG.tel.shift();
+    }
     drawGame(); drawScope();
     if (P.show3d) draw3D();
     hud();
@@ -926,6 +967,9 @@ async function boot() {
       FLAPPY.vyGate = info.bidi.vy_gate ?? FLAPPY.vyGate;
       FLAPPY.ceilBoost = info.bidi.ceil_boost ?? FLAPPY.ceilBoost;
       FLAPPY.groups = info.bidi.groups ?? FLAPPY.groups;
+      FLAPPY.dorsScale = info.bidi.dors_scale ?? FLAPPY.dorsScale;
+      FLAPPY.ventGain = info.bidi.vent_gain ?? FLAPPY.ventGain;
+      FLAPPY.ventDev = info.bidi.vent_dev ?? FLAPPY.ventDev;
     }
     if (info.max_climb != null) FLAPPY.maxClimb = info.max_climb;
     const buf = await (await fetch('/api/coords.bin')).arrayBuffer();

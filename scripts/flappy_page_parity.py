@@ -40,10 +40,10 @@ class PageWorld(fb.World):
     `spawnPipe()` 那段可解性约束。物理与碰撞一行不改。
     """
 
-    def __init__(self, rng, max_climb=40.0):
+    def __init__(self, rng, max_climb=40.0, first_gap_extra=160.0):
         self._mc = max_climb
         super().__init__(rng, gap_top=fb.NATURAL_GAP_TOP, solvable=True,
-                         max_climb=max_climb)
+                         max_climb=max_climb, first_gap_extra=first_gap_extra)
 
     def _next_gap_top(self) -> float:
         """= app.js 的 spawnPipe()：lo=70, hi=G.H-GAP-150=402"""
@@ -58,8 +58,13 @@ class PageWorld(fb.World):
         return float(v)
 
 
-def page_geometry(w: fb.World, y: float, vy: float, gap_c: float, margin: float):
-    """= app.js 的 bidiBody()：返回 (up, theta_deg, amp) 或 None（不驱动）。"""
+def page_geometry(w: fb.World, y: float, vy: float, gap_c: float, margin: float,
+                  dors_scale: float = 1.0, vent_gain: float = 1.0,
+                  vent_dev: float = 120.0):
+    """= app.js 的 bidiBody()：返回 (up, theta_deg, amp) 或 None（不驱动）。
+
+    amp 已经带上两条支路各自的权重（dors_scale / vent_gain），与服务器 _bidi_plan 一致。
+    """
     up = gap_c < y - margin
     if not (up or gap_c > y + margin):
         return None
@@ -68,6 +73,12 @@ def page_geometry(w: fb.World, y: float, vy: float, gap_c: float, margin: float)
     theta = np.degrees(2 * np.arctan2(0.55, dist))
     x = max(theta, 0.0) ** 3.0
     amp = x / (x + 30.0 ** 3.0)
+    if not up:
+        amp *= dors_scale
+    elif vent_gain != 1.0:
+        dev = max(0.0, y - gap_c)
+        sc = min(1.0, dev / max(vent_dev, 1e-6))
+        amp = min(1.0, amp * (1.0 + (vent_gain - 1.0) * sc))
     return bool(up), float(theta), float(amp)
 
 
@@ -78,6 +89,10 @@ def main() -> int:
     ap.add_argument("--max-ticks", type=int, default=5000)
     ap.add_argument("--max-climb", type=float, default=40.0)
     ap.add_argument("--gap-margin", type=float, default=18.0)
+    ap.add_argument("--first-gap-extra", type=float, default=160.0)
+    ap.add_argument("--dors-scale", type=float, default=0.35)
+    ap.add_argument("--vent-gain", type=float, default=2.0)
+    ap.add_argument("--vent-dev", type=float, default=120.0)
     a = ap.parse_args()
 
     h = fb.Harness(a.asset)
@@ -89,13 +104,15 @@ def main() -> int:
 
     for k in range(a.games):
         rng = np.random.default_rng(1000 + k)
-        w = PageWorld(rng, max_climb=a.max_climb)
+        w = PageWorld(rng, max_climb=a.max_climb, first_gap_extra=a.first_gap_extra)
         h.base.reset()
         recent.clear()
         cooldown_left = 0.0
         for tick in range(a.max_ticks):
             # ---- 页面算法：算几何 → 送驱动 → 脑推进
-            g = page_geometry(w, w.y, w.vy, w.gap_center(), a.gap_margin)
+            g = page_geometry(w, w.y, w.vy, w.gap_center(), a.gap_margin,
+                               dors_scale=a.dors_scale, vent_gain=a.vent_gain,
+                               vent_dev=a.vent_dev)
             if g is not None and (g[0] and w.vy > 0 or (not g[0]) and w.vy < 0):
                 up, _theta, amp = g
                 parts_i, parts_p = [], []
@@ -137,7 +154,9 @@ def main() -> int:
     # ---- 对照：评测台同一配置
     spec = dict(s50=15.0, s50size=30.0, gain=1.0, width=0.5, baseline=0.25,
                 ground_aware=1, elev_scale=1.0, pipe_w=1.0, span=0.6, base=0.6,
-                gap_margin=a.gap_margin, vy_gate=1, max_climb=a.max_climb)
+                gap_margin=a.gap_margin, vy_gate=1, max_climb=a.max_climb,
+                dors_scale=a.dors_scale, vent_gain=a.vent_gain,
+                vent_dev=a.vent_dev, first_gap_extra=a.first_gap_extra)
     ref = [h.play("bidi", spec, seed=1000 + k, max_ticks=a.max_ticks, policy="brain")
            for k in range(n)]
     rs = np.array([r["score"] for r in ref], float)

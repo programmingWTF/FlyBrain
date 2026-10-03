@@ -59,11 +59,22 @@ GROUND = 92.0                     # 地面高度
 GROUND_Y = G_H - GROUND           # 地面线 y = 528
 PX_PER_M = 240.0                  # 世界尺度（= app.js 的 PX_PER_M）
 # ---- 双向逼近反射的投射参数（与 scripts/flappy_bench.py 的默认值一致）----
+#: dors_scale / vent_gain 是本轮调出来的两个旋钮，性质上**是外部介入**，
+#: 不是连接组里量出来的 —— 报告里必须这么写（见 ESCAPE.md §6.7 的"分账"）。
+#:   dors_scale=0.35：背侧（下潜）支按 0.35 缩。实测越强越差（1.0→撞天花板 24/80），
+#:                    0.35 时撞天花板归零、均分 31→41。
+#:   vent_gain=2.0 ：缺口明显在上方时把腹侧（爬升）驱动放大。实测撞管死亡**全部**
+#:                    是"偏低没爬够"，放大后均分 40→62、存活满 69/80。
 BIDI = dict(s50size=30.0, n=3.0, gain=1.0, gap_margin=18.0, vy_gate=1,
-            ceil_boost=1.0, groups=["LC4", "LPLC2"])
+            ceil_boost=1.0, groups=["LC4", "LPLC2"],
+            dors_scale=0.35, vent_gain=2.0, vent_dev=120.0)
 #: 相邻缺口的向上跳变上限（px）—— 与 bench 的 max_climb 一致：
 #: 这是"关卡按执行器带宽生成"那一条（ESCAPE.md 6.3）
 MAX_CLIMB = 40.0
+#: 第 2 根管子的额外间距（px）。实测调完上面两个旋钮后，剩下的撞管死亡
+#: **全部集中在第 2 根**（13/22，死亡时刻 3.16s ≈ 第 2 根到达），且都是"偏低没爬够"。
+#: 给它更多时间即可：≤2 分局占比 12% → 6%。这同样是**改游戏**，单独报账。
+FIRST_GAP_EXTRA = 160.0
 WINDOW = 5                        # 100ms = 5 个 20ms tick
 VIZ_SAMPLE = 12000                # 全脑"点亮"用的随机抽样规模
 LIT_TYPES = ["LC4", "DNp01", "DNp04", "LC10a", "DNp02", "DNp11"]
@@ -290,6 +301,9 @@ class Session:
         margin = float(b.get("gap_margin", 18.0))
         vy_gate = int(b.get("vy_gate", 1))
         boost = float(b.get("ceil_boost", 1.0))
+        dors_scale = float(b.get("dors_scale", 1.0))
+        vent_gain = float(b.get("vent_gain", 1.0))
+        vent_dev = float(b.get("vent_dev", 120.0))
         groups = b.get("groups") or ["LC4", "LPLC2"]
 
         # ---- 方向（纯几何）
@@ -313,6 +327,15 @@ class Session:
             theta *= boost
         x = max(theta, 0.0) ** n
         amp = float(b.get("gain", 1.0)) * (x / (x + s50size ** n))
+        # ---- 两条支路各自的权重（这两个旋钮是**外部介入**，不是连接组事实）
+        if not up:
+            # 背侧（下潜）支：实测越强越差（它会把鸟推去撞天花板）
+            amp *= dors_scale
+        elif vent_gain != 1.0:
+            # 腹侧（爬升）支：缺口明显在上方时放大 —— 撞管死亡 100% 是"偏低没爬够"
+            dev = max(0.0, y - gap)
+            sc = min(1.0, dev / max(vent_dev, 1e-6))
+            amp = min(1.0, amp * (1.0 + (vent_gain - 1.0) * sc))
         # ---- 整半招募
         idx, pv, eff = [], [], 0.0
         for gname in groups:
@@ -471,7 +494,7 @@ class Session:
             retino_axis=getattr(self, "retino_axis", None),
             lit=self.lit, r50=0.577,
             # 前端要用这些常数复现引擎的关卡生成与双向投射（别在前端另写一套数）
-            bidi=dict(BIDI), max_climb=MAX_CLIMB,
+            bidi=dict(BIDI), max_climb=MAX_CLIMB, first_gap_extra=FIRST_GAP_EXTRA,
             geom=dict(g_h=G_H, ground=GROUND, ground_y=GROUND_Y, px_per_m=PX_PER_M),
         )
 

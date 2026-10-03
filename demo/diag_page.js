@@ -99,6 +99,39 @@ async function getWsUrl() {
   console.log('  canvas game   :', await evalJs('(function(){var c=document.getElementById("game");return c?c.width+"x"+c.height:"无"})()'));
   console.log('  canvas brain  :', await evalJs('(function(){var c=document.getElementById("brain");return c?c.width+"x"+c.height:"无"})()'));
 
+  // 脑 tick 数 vs 物理帧：错配修好后两者应当 1:1（评测台就是严格 1:1）。
+  // ⚠️ 口径：这里是 **Δframes : ΔbrainTicks**，不是反过来。
+  //    <1 表示脑比物理慢（页面整体变慢）；>1 表示物理跑在脑前面（鸟偏重，是之前那个 bug）。
+  const t1 = await evalJs('window.__dbg && window.__dbg.brainTicks');
+  const f1 = await evalJs('window.__dbg && window.__dbg.frames');
+  await sleep(8000);
+  const t2 = await evalJs('window.__dbg && window.__dbg.brainTicks');
+  const f2 = await evalJs('window.__dbg && window.__dbg.frames');
+  const dt = (t2 - t1) || 0, df = (f2 - f1) || 0;
+  console.log('  brainTicks    :', t1, '->', t2, `  (Δ${dt})`);
+  console.log('  frames        :', f1, '->', f2, `  (Δ${df})`);
+  if (dt > 0) {
+    const brainHz = dt / 8;                 // 实测脑速率（tick/秒）
+    console.log(`  脑速率        : ${brainHz.toFixed(1)} tick/s  (dt=20ms 应为 50；`
+      + `低了就是页面整体变慢)`);
+    console.log(`  帧 : 脑tick   : ${(df / dt).toFixed(2)} : 1  `
+      + `(1.00 = 物理与脑严格同步；<1 = 脑跟不上、游戏变慢)`);
+  }
+  console.log('  当前分数      :', await evalJs('(window.G && G.score) ?? "?"'),
+              ' 死因:', await evalJs('(window.G && G.cause) || "无"'));
+
+  // 连续观察：页面到底能不能过管子（能过就说明时序改对了）
+  console.log('\n=== 连续观察分数（每 2 秒一次，共 ~24 秒）===');
+  const seen = [];
+  for (let i = 0; i < 12; i++) {
+    const s = await evalJs('(window.G && G.score) ?? -1');
+    const c = await evalJs('(window.G && G.cause) || "-"');
+    const np = await evalJs('(window.G && G.pipes && G.pipes.length) ?? -1');
+    seen.push(s);
+    console.log(`  t+${(i + 1) * 2}s  分数=${s}  管子数=${np}  死因=${c}`);
+  }
+  console.log(`  最高分 ${Math.max(...seen)}  末次 ${seen[seen.length - 1]}`);
+
   ws.close();
   try { child.kill(); } catch (_) {}
   process.exit(0);
