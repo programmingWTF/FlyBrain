@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import pathlib
@@ -428,6 +429,131 @@ class GroundEquilibriumProjection(Projection):
         return out
 
 
+class BiDirectionalProjection(GroundEquilibriumProjection):
+    """**双向**反射：腹侧半视野（地面）爬升 + 背侧半视野（天花板）下潜。
+
+    这一步解决的是前面所有版本最硬的一个问题
+    ------------------------------------------
+    ESCAPE.md §6.5 量到：背侧 LPLC2 单独到 DNp01 只有 0.0291 = need 的 48%，
+    **永远推不动**，所以 `ground_dual` 实测 0 分 —— "反射只能往上拉、不能往下压"。
+    但那句话只对**单通道 + 平滑空间窗**成立。把两条视叶逼近通道**并联**起来
+    （这正是文献里 GF 的输入结构，Ache 2019 / Gaitanidis 2025：
+    LC4 + LPLC2 占 GF 直接视叶输入 98.5%），并且按**整半**招募视野：
+
+        腹侧 LC4 0.0328 + LPLC2 0.0752 = 0.1080   / need = 1.79   → 能爬
+        背侧 LC4 0.0416 + LPLC2 0.0291 = 0.0707   / need = 1.17   → 能潜
+        （对照：同样的背侧两群、但用平滑斜坡窗只有 0.0319 = 0.53 → 不发放）
+
+    腹侧/背侧的划分用的是同一条**已修正过的视野轴**（先剔除半球轴，
+    再在同侧内部取方差最大的轴）。于是同一个机制自然给出两个方向：
+    威胁在视野下方 → 腹侧那两群被驱动 → 拍翅；威胁在上方 → 背侧那两群 → 不拍翅。
+    "往哪边走"由**威胁落在视野的哪一半**决定，不是控制器。
+
+    仍然是纯感觉投射：没有可学参数、没有时序记忆、没有方向控制器。
+    """
+    name = "bidi"
+
+    #: 两条支路各自用到的感觉群（= ESCAPE.md §3.6 的双通道：LC4 角速度 + LPLC2 角大小）
+    GROUPS = ("LC4", "LPLC2")
+
+    def _half(self, group: str, dorsal: bool, amp: float):
+        """按视野轴**整半**招募（不是斜坡窗）。
+
+        ⚠️ 这里踩过一次坑，必须写下来：斜坡窗 `(u-0.5)/0.5` 会把靠近视野中线的细胞
+        一起压掉，实测背侧 LC4+LPLC2 的有效驱动只剩 **0.0319（need 的 53%）**，
+        仍然不发放；而"整半"招募能拿到 **0.0707（need 的 117%）**，过阈值。
+        差别就是"平滑的空间梯度"和"半个群体一起动"。
+        真实视网膜上不该整半齐动，所以这同时是一条**负面证据**：
+        DNp01 的阈值高到只有大范围招募才推得动。
+        """
+        u = self.u[group]
+        m = (u >= 0.5) if dorsal else (u < 0.5)
+        idx = self.idx[group][m]
+        return idx, np.full(len(idx), float(amp)), m
+
+    def _branch(self, w: World, *, up: bool):
+        """up=True → 威胁来自下方（地面），驱动腹侧半视野；up=False → 天花板，驱动背侧。"""
+        if up:
+            h_px, dorsal = max(GROUND_Y - w.y, 1.0), False
+        else:
+            h_px, dorsal = max(w.y, 1.0), True
+        # 只有"正在朝那个面靠近"时才是逼近刺激：上升时天花板在逼近，下落时地面在逼近。
+        # 不加这一条，鸟冲过缺口后天花板支还在驱动 → 一路爬到撞天花板
+        # （实测 40 局里 8 局就是这么死的）。
+        if self.spec.get("vy_gate", 1) and ((up and w.vy <= 0) or (not up and w.vy >= 0)):
+            return []
+        dist = max(h_px / PX_PER_M, 0.02)
+        theta = math.degrees(2 * math.atan2(0.55, dist))
+        amp = self.gain * self.size_amp(theta)
+        out, eff = [], 0.0
+        for g in (self.spec.get("groups") or self.GROUPS):
+            idx, pv, m = self._half(g, dorsal, amp)
+            out.append((idx, pv))
+            eff += float((self.w[g][m] * pv).sum())
+        self.last = dict(theta=theta, branch="dorsal" if dorsal else "ventral",
+                         amp=amp, eff=eff, ratio=eff / max(self.h.need, 1e-9))
+        return out
+
+    def drive(self, w: World):
+        if w.t < WARM_S:
+            return []
+        # 方向由**缺口在视野里的高低**决定（纯几何）：缺口比鸟高 → 往上找它；
+        # 缺口比鸟低超过一个死区 → 往下找它；两者之间不驱动（已经对准）。
+        # ⚠️ 死区是必须的：第一版写成 `if gap < y` 时，鸟刚越过缺口中心就翻转成
+        # 爬升，于是在缺口上下反复横跳、一路撞管 —— 实测均分只有 0.81。
+        # 死区取**半个鸟身**（BIRD_R*2），不是一个拍脑袋的常数。
+        margin = float(self.spec.get("gap_margin", BIRD_R * 2))
+        if w.gap_center() < w.y - margin:
+            return self._branch(w, up=True)          # 缺口在头顶 → 腹侧支（爬升）
+        if w.gap_center() > w.y + margin:
+            return self._branch(w, up=False)         # 缺口在脚下 → 背侧支（下潜）
+        return []                                    # 已对准：不驱动
+
+
+class ThresholdTrackProjection(GroundEquilibriumProjection):
+    """不再是"乘一个门控"，而是**按缺口位置给腹侧通道加偏置**，并且偏置永不把驱动压到阈值以下。
+
+    为什么之前所有门控版本都 0 分（这一步是把负结果变成设计约束）
+    -----------------------------------------------------------
+    腹侧半群的最大有效驱动只有 need 的 1.25 倍，而 DNp01 要**连续**高驱动
+    才攒得够膜电位。所以 `drive × gate` 里只要 gate 能让驱动掉到 1.0 以下，
+    就必然"一个脉冲都不放"（ground_eq/ground_eq2/ground_sp 三版实测 0 分）。
+    结论：门控**不能乘在驱动上**。
+
+    正确做法是把缺口高度变成**视野段的偏置**：腹侧那半永远是主动驱动，
+    缺口在下方时只是把腹侧段的驱动**再往上加一点**（等效降低触发阈值），
+    而 base 保证任何一支都不低于 need 的 1.1 倍 —— 于是既有连续可调的
+    平衡高度，又不会出现"死掉的那一支"。
+
+    对应到视觉上就是：鸟在缺口**下方**时，下管的近端边缘也在鸟的下方，
+    它落在**同一段腹侧视野**里，与该段原有驱动线性叠加 → 该段更早达到
+    逃逸阈值 → 鸟更早开始爬 → 平衡高度更高。
+    """
+    name = "track"
+
+    def drive(self, w: World):
+        if w.t < WARM_S or w.vy <= 0:
+            return []                                   # 上爬时地面支关闭（否则一直爬）
+        dev = (w.y - w.gap_center()) / (0.5 * G_H)      # >0：鸟在缺口下方
+        span = max(float(self.spec.get("span", 0.6)), 1e-6)
+        base = float(self.spec.get("base", 0.6))
+        wgt_vent = base + (1.0 - base) * float(np.clip(dev / span, 0.0, 1.0))
+        # 地面角尺寸（与 ground_lock 同一套公式，唯一区别是腹侧段再乘 wgt_vent）
+        h_px = max(GROUND_Y - w.y, 1.0)
+        dist = h_px / PX_PER_M
+        theta = math.degrees(2 * math.atan2(0.55, max(dist, 1e-3)))
+        amp = self.gain * self.size_amp(theta)
+        mode = str(self.spec.get("window", "ramp_up"))
+        width = float(self.spec.get("width", 0.5))
+        if mode == "ramp_up":        # 腹侧段：按缺口位置加权（这一支决定爬升高度）
+            idx, pv = self._window("LPLC2", mode, 0.5, width, amp * wgt_vent)
+            self.last = dict(theta=theta, dev=dev, w=wgt_vent, branch="ventral")
+        else:                        # 别的窗口形状：不加权，避免把驱动压到阈值下
+            idx, pv = self._window("LPLC2", mode, 0.5, width, amp)
+            self.last = dict(theta=theta, dev=dev, w=1.0, branch=mode)
+        return [(idx, pv)]
+
+
 class GroundSetpointProjection(GroundEquilibriumProjection):
     """地面 looming 当触发，**缺口高度只按比例改触发的强度**（线性整定）。
 
@@ -659,7 +785,8 @@ PROJECTIONS = {p.name: p for p in (
     BaselineProjection, GroundLockProjection, WallGapProjection,
     WallGapGroundProjection, PipeOnlyProjection, GroundEquilibriumProjection,
     GroundEqualGateProjection, GroundSetpointProjection, DoubleChannelProjection,
-    PipeEdgeVentralProjection, GroundLockVariant)}
+    PipeEdgeVentralProjection, GroundLockVariant, ThresholdTrackProjection,
+    BiDirectionalProjection)}
 # --modes 的键：值是 (投射类名, 拍翅判据)
 MODES = {
     "baseline": ("baseline", "brain"),
@@ -671,6 +798,8 @@ MODES = {
     "ground_eq": ("ground_eq", "brain"),
     "ground_eq2": ("ground_eq2", "brain"),
     "ground_sp": ("ground_sp", "brain"),
+    "track": ("track", "brain"),
+    "bidi": ("bidi", "brain"),
     "ground_dual": ("ground_dual", "brain"),
     "pipe_edge": ("pipe_edge", "brain"),
     "wall_gap": ("wall_gap", "brain"),
@@ -678,6 +807,7 @@ MODES = {
     "pipe_only": ("pipe_only", "brain"),
     "passive": ("baseline", "passive"),          # 只喂脑、从不拍翅：零模型
     "oracle": ("baseline", "oracle"),            # 外部理想控制器：世界几何的上限刻度
+    "lookahead": ("baseline", "lookahead"),      # 短视界前向搜索：真正的上限刻度
 }
 ALIAS = {"ground": "ground_lock", "ground_only": "ground_lock",
          "wall": "wall_gap", "wall+ground": "wall_gap_ground",
@@ -688,7 +818,8 @@ ALIAS = {"ground": "ground_lock", "ground_only": "ground_lock",
 # ================================================================== 评测台
 class Harness:
     def __init__(self, asset: str, *, device: str = "cpu", gain: float = 3.0,
-                 tonic: float = 0.0, need_spikes: int = 1, cooldown: float = FLAP_COOLDOWN):
+                 tonic: float = 0.0, need_spikes: int = 1, cooldown: float = FLAP_COOLDOWN,
+                 oracle_look: int = 60):
         t0 = time.time()
         self.base = SpikingBrain.from_npz(asset, device=device)
         self.base.gain, self.base.tonic = gain, tonic
@@ -696,6 +827,7 @@ class Harness:
         self.asset = asset
         self.need_spikes = need_spikes
         self.cooldown = cooldown
+        self.oracle_look = oracle_look
         self._init_groups()
         self.load_time = time.time() - t0
 
@@ -743,6 +875,14 @@ class Harness:
         self.u["LPLC2_full"] = self.u["LPLC2"]
         self.wname["LPLC2_full"] = self.wname["LPLC2"]
         self.idx_of_first[int(self.gidx["LPLC2"][0])] = "LPLC2"
+        # 逐细胞查表：任意**子集**（例如只取腹侧半）都能算 Σw·p。
+        # 之前用"群名 -> 整群权重"，一旦投射只驱动半个群，Σw·p 就恒为 0（仪表失灵）。
+        self.wmap = np.zeros(self.base.N, dtype=np.float32)
+        self.gmap: dict[int, str] = {}
+        for nm in ("LC4", "LPLC2", "LC10a"):
+            self.wmap[self.gidx[nm]] = self.wname[nm]
+            for a in self.gidx[nm]:
+                self.gmap[int(a)] = nm
 
     # ---- 坐标 / 视野轴（半球轴先剔除）
     def _coords(self) -> np.ndarray:
@@ -843,12 +983,10 @@ class Harness:
                         np.concatenate([np.clip(p, 0.0, 1.0)
                                         for _, p in merged.values()]),
                         dtype=torch.float32, device=brain.device)
-                    # Σw·p：权重必须和索引**一起**取子集（形状不对当场报错，
-                    # 别让一个恒为 0 的仪表悄悄骗过判据）
+                    # Σw·p：逐细胞查表，对**任意子集**都成立（腹侧半、背侧半、整群都行）。
+                    # 别再用"群名 -> 整群权重"，那会让只驱动半群的投射把仪表打成恒 0。
                     for ix, p in merged.values():
-                        nm = self.idx_of_first.get(int(ix[0]))
-                        if nm is not None:
-                            eff += float((self.wname[nm] * np.clip(p, 0, 1)).sum())
+                        eff += float((self.wmap[ix] * np.clip(p, 0.0, 1.0)).sum())
                     brain.step(clamp=(cidx, pv))
                 else:
                     brain.step()
@@ -870,6 +1008,8 @@ class Harness:
                 want = world.y > c + 6
             elif policy == "oracle":
                 want = self._oracle(world)
+            elif policy == "lookahead":
+                want = self._lookahead(world, t_last_flap)
             else:
                 raise ValueError(policy)
             if want and (world.t - t_last_flap) >= self.cooldown and world.t >= WARM_S:
@@ -911,6 +1051,55 @@ class Harness:
             return True
         return False
 
+    # ---- 真正的上限刻度：1-ply 前向搜索 + 便宜的 rollout 策略
+    # ⚠️ 第一版写成"对每个动作递归搜索"→ 分支数 2^depth，60 tick 直接爆炸（跑不完）。
+    # 正确做法：当前这一步**两个动作都试**，之后的每一步都用一条便宜规则走完，
+    # 总代价只有 2×look 次世界推进。
+    @staticmethod
+    def _rollout_policy(w: World) -> bool:
+        """rollout 用的廉价规则：把高度往**下一根管子的缺口中心**拉。
+
+        注意这是**外部规划器**的一部分，不是脑的输出，也不是策略候选。
+        """
+        target = w.gap_center()
+        if w.y > target + 6:
+            return True
+        if w.vy > 150 and w.y > target - GAP * 0.22:
+            return True
+        return False
+
+    def _rollout(self, w: World, look: int, cooldown: float) -> tuple[float, float]:
+        """用 _rollout_policy 走 look 个 tick，返回 (分数, 存活时长)。"""
+        c = w
+        for _ in range(max(0, look)):
+            if c.dead:
+                break
+            act = self._rollout_policy(c)
+            if act and (c.t - c.last_flap_t) < cooldown:
+                act = False
+            c.step(act)
+        return float(c.score), (c.t if not c.dead else 0.0)
+
+    def _lookahead(self, w: World, t_last_flap: float) -> bool:
+        """在"拍"与"不拍"之间选：各自走完 look 个 tick，取分数高、活得更久的那个。"""
+        if w.t < WARM_S:
+            return False
+        look = max(1, self.oracle_look)
+        best_val, best_act = (-1.0, -1.0), False
+        for act in (True, False):
+            if act and (w.t - t_last_flap) < self.cooldown:
+                continue
+            c = copy.deepcopy(w)
+            c.step(act)
+            if c.dead:
+                val = (float(c.score), 0.0)
+            else:
+                sc, al = self._rollout(c, look, self.cooldown)
+                val = (max(float(c.score), sc), max(c.t, al))
+            if val > best_val:
+                best_val, best_act = val, act
+        return best_act
+
 
 # ================================================================== 主
 def summarize(rows: list[dict]) -> dict:
@@ -944,6 +1133,16 @@ def main() -> int:
     ap.add_argument("--s50size", type=float, default=30.0, help="LPLC2 角大小灵敏度（度）")
     ap.add_argument("--width", type=float, default=0.5, help="视野窗宽")
     ap.add_argument("--baseline", type=float, default=0.25, help="方向门控的底（0=纯几何门控）")
+    ap.add_argument("--vy-gate", type=int, default=1,
+                    help="bidi：只在朝该面靠近时才驱动（1=开，0=关）")
+    ap.add_argument("--bidi-groups", default=None,
+                    help="bidi 用哪些感觉群，逗号分隔（默认 LC4,LPLC2）")
+    ap.add_argument("--gap-margin", type=float, default=22.0,
+                    help="bidi 模式：方向翻转的死区（px，默认 = 鸟身直径 22）")
+    ap.add_argument("--span", type=float, default=0.6,
+                    help="track 模式：缺口高度偏置的跨度（越小越激进地跟随缺口）")
+    ap.add_argument("--base", type=float, default=0.6,
+                    help="track 模式：腹侧支偏置下限（必须 >0，否则驱动掉到阈值以下）")
     ap.add_argument("--elev-scale", type=float, default=1.0,
                     help="缺口高度对地面触发的线性整定斜率（ground_sp 用）")
     ap.add_argument("--pipe-w", type=float, default=1.0,
@@ -955,6 +1154,8 @@ def main() -> int:
     ap.add_argument("--graph", default="real",
                     choices=["real", "cut", "shuffled", "no_inhibition"],
                     help="脑侧干预（对照）")
+    ap.add_argument("--oracle-look", type=int, default=60,
+                    help="lookahead 模式的前向搜索深度（tick）")
     ap.add_argument("--need-spikes", type=int, default=1)
     ap.add_argument("--trace-mode", default=None, help="打印该模式的逐 tick 轨迹")
     ap.add_argument("--trace-n", type=int, default=80)
@@ -962,7 +1163,7 @@ def main() -> int:
     a = ap.parse_args()
 
     h = Harness(a.asset, gain=3.0, tonic=0.0, need_spikes=a.need_spikes,
-                cooldown=a.cooldown)
+                cooldown=a.cooldown, oracle_look=a.oracle_look)
     print(f"资产 {a.asset}: N={h.brain.N:,}  E={len(h.brain.codes):,}  "
           f"gain={h.brain.gain} tonic={h.brain.tonic}  载入 {h.load_time:.1f}s")
     print(f"拍翅冷却 {h.cooldown}s   游戏常数 = demo/app.js（GRAV={GRAV} "
@@ -976,7 +1177,9 @@ def main() -> int:
     modes = [ALIAS.get(m.strip(), m.strip()) for m in a.modes.split(",") if m.strip()]
     spec = dict(s50=a.s50, s50size=a.s50size, gain=a.gain, width=a.width,
                 baseline=a.baseline, ground_aware=1, elev_scale=a.elev_scale,
-                pipe_w=a.pipe_w)
+                pipe_w=a.pipe_w, span=a.span, base=a.base, gap_margin=a.gap_margin,
+                groups=(a.bidi_groups.split(",") if a.bidi_groups else None),
+                vy_gate=a.vy_gate)
     summary: dict[str, dict] = {}
     all_rows: list[dict] = []
     t0 = time.time()

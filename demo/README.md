@@ -83,22 +83,27 @@ D:/Code/FlyBrain/env/python.exe demo/server.py --asset spiking_full
 和 `scripts/loom_*.py` 那套实验代码**完全同一份**。所以演示里看到的
 就是报告 `ESCAPE.md` 里量的那些数。
 
-## ⚠️ 页面的 Flappy 投射仍是旧的（2026-10-03 第二轮说明）
+## ⚠️ 页面的 Flappy 投射仍是旧的（2026-10-03 说明）
 
-命令行评测台 `scripts/flappy_bench.py` 找到了一个**更好的感觉投射**
-（腹侧半视野 LPLC2 读地面角尺寸，40 局均分 **2.23 / 最高 7**，
-页面当前的"最近碰撞 + LC4 角速度"是 **1.52 / 最高 5**）。细节见 `ESCAPE.md` §6bis。
+命令行评测台 `scripts/flappy_bench.py` 找到了两个**更好的感觉投射**：
 
-页面**还没有**切到这个新投射，所以浏览器里看到的分数会低于上面那个数字。
+| 投射 | 均分（60 局） | 最高 |
+|---|---|---|
+| 页面当前："最近碰撞 + LC4 角速度" | 1.58 | 5 |
+| 第一轮：腹侧 LPLC2 读地面角尺寸 | 2.03 | 7 |
+| **第二轮：双向逼近反射（腹侧爬升 + 背侧下潜 + 接近速度门控）** | **7.20** | **26** |
+
+细节见 `ESCAPE.md` §6。页面**还没有**切到新投射，所以浏览器里看到的分数会低于上表。
 要复现报告里的数，请用命令行：
 
 ```bash
 PY=D:/Code/FlyBrain/env/python.exe
-$PY scripts/flappy_bench.py --asset spiking_full --modes ground_lock --games 40 --max-ticks 1500
-$PY scripts/flappy_experiments.py --games 40      # 全套对照一次跑完
+$PY scripts/flappy_bench.py --asset spiking_full --modes baseline,ground_lock,bidi,lookahead \
+    --games 60 --max-ticks 2500 --gap-margin 22 --vy-gate 1
+$PY scripts/flappy_experiments.py --games 60 --max-ticks 2500   # 全套对照一次跑完
 ```
 
-两个数字都是同一颗冻结脑、零可学参数跑出来的；差别只在**刺激投给哪些细胞**。
+这些都是同一颗冻结脑、零可学参数跑出来的；差别只在**刺激投给哪些细胞**。
 
 ## 已知限制（演示里也写了，别对外夸大）
 

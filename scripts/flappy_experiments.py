@@ -63,18 +63,38 @@ def main() -> int:
     table: list[dict] = []
 
     # ---- 实验 1：主对照（同一颗脑、同一套物理，只换感觉投射）
-    d = run("main", "passive,baseline,ground_lock,pipe_edge,ground_dual,oracle",
-            games=a.games, max_ticks=a.max_ticks, extra=[], asset=a.asset)
+    d = run("main", "passive,baseline,ground_lock,bidi,lookahead",
+            games=a.games, max_ticks=a.max_ticks,
+            extra=["--gap-margin", "22", "--vy-gate", "1", "--oracle-look", "80"],
+            asset=a.asset)
     notes = {
         "passive": "零模型：同一套驱动喂给脑，但从不拍翅",
         "baseline": "当前页面做法：最近碰撞 + LC4 单通道角速度",
-        "ground_lock": "腹侧 LPLC2 读地面角尺寸（本任务推荐）",
-        "pipe_edge": "在腹侧通道上叠加管子近端边缘 looming",
-        "ground_dual": "腹侧+背侧都接（检验背侧能不能推下潜）",
-        "oracle": "外部理想控制器：世界几何的上限刻度，非策略候选",
+        "ground_lock": "腹侧 LPLC2 读地面角尺寸（第一轮最好）",
+        "bidi": "腹侧/背侧双通道 + 接近速度门控（本轮最好）",
+        "lookahead": "外部规划器：世界几何的上限刻度，非策略候选",
     }
     for m in d["summary"]:
         table.append(row(d, m, "main", notes.get(m, "")))
+
+    # ---- 实验 1b：bidi 的成分消融（每一条都决定分数归零还是保住）
+    for tag, extra, note in (
+        ("bidi_no_vygate", ["--vy-gate", "0"], "关掉接近速度门控"),
+        ("bidi_no_lc4", ["--bidi-groups", "LPLC2"], "只用 LPLC2（去掉 LC4）"),
+        ("bidi_m8", ["--gap-margin", "8"], "死区 8 px"),
+        ("bidi_m15", ["--gap-margin", "15"], "死区 15 px"),
+        ("bidi_m35", ["--gap-margin", "35"], "死区 35 px"),
+    ):
+        d1 = run(tag, "bidi", games=a.games, max_ticks=a.max_ticks,
+                 extra=["--gap-margin", "22", "--vy-gate", "1"] + extra, asset=a.asset)
+        table.append(row(d1, "bidi", tag, note=note))
+
+    # ---- 实验 1c：bidi 的脑侧干预（对照）
+    for g in ("cut", "shuffled"):
+        d1 = run(f"bidi_graph_{g}", "bidi", games=a.games, max_ticks=a.max_ticks,
+                 extra=["--gap-margin", "22", "--vy-gate", "1", "--graph", g],
+                 asset=a.asset)
+        table.append(row(d1, "bidi", f"graph={g}", note="脑侧干预"))
 
     # ---- 实验 2：投射侧的灵敏度（s50size 是唯一的外部假设旋钮）
     for s50 in (20, 30, 45):
