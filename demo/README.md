@@ -83,6 +83,23 @@ D:/Code/FlyBrain/env/python.exe demo/server.py --asset spiking_full
 和 `scripts/loom_*.py` 那套实验代码**完全同一份**。所以演示里看到的
 就是报告 `ESCAPE.md` 里量的那些数。
 
+## ⚠️ 页面的 Flappy 投射仍是旧的（2026-10-03 第二轮说明）
+
+命令行评测台 `scripts/flappy_bench.py` 找到了一个**更好的感觉投射**
+（腹侧半视野 LPLC2 读地面角尺寸，40 局均分 **2.23 / 最高 7**，
+页面当前的"最近碰撞 + LC4 角速度"是 **1.52 / 最高 5**）。细节见 `ESCAPE.md` §6bis。
+
+页面**还没有**切到这个新投射，所以浏览器里看到的分数会低于上面那个数字。
+要复现报告里的数，请用命令行：
+
+```bash
+PY=D:/Code/FlyBrain/env/python.exe
+$PY scripts/flappy_bench.py --asset spiking_full --modes ground_lock --games 40 --max-ticks 1500
+$PY scripts/flappy_experiments.py --games 40      # 全套对照一次跑完
+```
+
+两个数字都是同一颗冻结脑、零可学参数跑出来的；差别只在**刺激投给哪些细胞**。
+
 ## 已知限制（演示里也写了，别对外夸大）
 
 - 模型时钟 dt = 20 ms，而真实 GF 通路是 1.4–25 ms，**延迟数字只能定性**。
