@@ -20,6 +20,8 @@ const FLAP_COOLDOWN = 0.14;        // 两次拍翅最小间隔（秒）
 const STRICT = /[?&]strict=1\b/.test(location.search);
 //: 严格模式跑多少个 tick 就停（用于量分）。5000 tick = 100s 游戏时间。
 const STRICT_TICKS = 5000;
+// ?batch=N：一次向脑请求 N 个 tick（用于量"批大小 vs 速率/分数"的取舍）
+const BATCH_Q = Number((location.search.match(/[?&]batch=(\d+)/) || [])[1] || 0);
 
 const P = { s50: 15, s50size: 30, rad: 0.05, spd: 1.0, need: 1, graph: 'real',
             mode: 'flappy', tmax: 40, show3d: true };
@@ -42,7 +44,16 @@ const FLAPPY = { maxClimb: 40, gapMargin: 18, vyGate: 1, ceilBoost: 1.0,
                  //                   实测越强越差（1.0 时 80 局里 24 局撞天花板）
                  //   ventGain=2.0 ：缺口明显在上方时放大腹侧（爬升）驱动 ——
                  //                   撞管死亡 100% 是"偏低没爬够"
-                 dorsScale: 0.35, ventGain: 2.0, ventDev: 120 };
+                 dorsScale: 0.35, ventGain: 2.0, ventDev: 120,
+                 //: 一次向脑请求几个 tick。见主循环里的说明。
+                 //
+                 // 实测（无头 Edge，42~90 秒窗口，同一台机）：
+                 //   batch=1 → 14.3 tick/s，最高 6 分
+                 //   batch=4 → 20.4 tick/s，最高 19 分   ← 取它
+                 //   batch=8 → 15.1 tick/s，最高 10 分
+                 // batch=4 明显最好：批太小喂不饱脑（受 fetch 往返 ~70ms 限制），
+                 // 批太大则视觉输入滞后太多、控制变钝。4 是这两者的折中。
+                 batch: 4 };
 const S = { info: null, coords: null, ready: false };
 
 // ---------------------------------------------------------------- 游戏状态
@@ -950,12 +961,18 @@ function loop(ts) {
       }
     } else {
       // 固定步长：物理按"脑 tick 数"推进，不按墙上时钟。
-      // 原来 `physics(dt)` 用墙上 dt，而脑每帧最多 1 tick → 物理 1.24 步 : 脑 1 tick，
-      // 同样的脑 tick 数下鸟多落 24%、拍翅相对弱 24%。
       const ticks = Math.floor((G.acc = Math.min(G.acc + dt, 0.3)) / TICK_S);
-      if (ticks > 0 && stepBrain(1)) {
-        G.acc -= TICK_S; DBG.brainTicks++;
-        physics(TICK_S);
+      // 批大小：一次请求向脑要几个 tick。
+      //
+      // 为什么可以 >1（推翻我之前的判断）：一次请求带回 N 个 tick 时，N 步物理
+      // **各自**都用同一个拍翅决策 —— 也就是控制回路本来就是按脑的决策率离散运行的，
+      // 并不是"物理跑在脑前面"。唯一代价是视觉输入最多滞后 N 个 tick。
+      // 而实测浏览器只能做到 14.3 req/s（需要 50 才 1:1 实时），
+      // 所以批大小是唯一能把速率提上来的旋钮 —— 到底值不值，直接量。
+      if (ticks > 0 && stepBrain(FLAPPY.batch)) {
+        const n = Math.min(ticks, FLAPPY.batch);
+        G.acc -= n * TICK_S; DBG.brainTicks += n;
+        for (let i = 0; i < n; i++) physics(TICK_S);
       } else if (ticks === 0) {
         physics(TICK_S);          // 不足一个 tick 也给一帧物理，保持画面连续
       }
@@ -998,6 +1015,7 @@ async function boot() {
       FLAPPY.ventGain = info.bidi.vent_gain ?? FLAPPY.ventGain;
       FLAPPY.ventDev = info.bidi.vent_dev ?? FLAPPY.ventDev;
     }
+    if (BATCH_Q > 0) FLAPPY.batch = BATCH_Q;
     if (info.max_climb != null) FLAPPY.maxClimb = info.max_climb;
     const buf = await (await fetch('/api/coords.bin')).arrayBuffer();
     S.coords = new Float32Array(buf);
