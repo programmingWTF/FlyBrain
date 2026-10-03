@@ -14,6 +14,7 @@
 <header>
   <h1>冻结的果蝇脑 · <span>视觉逼近逃跑反射</span></h1>
   <div id="stat">载入脑组织中 …</div>
+  <div id="fpsbox">帧率 <b id="h-fps">–</b></div>
 </header>
 
 <main>
@@ -47,7 +48,7 @@
       <div class="row"><i style="background:#ff8c1a"></i>LC4 视觉逼近神经元 ×104（输入）</div>
       <div class="row"><i style="background:#ff2d55"></i>DNp01 逃逸指令 ×2（输出）</div>
       <div class="row"><i style="background:#39d0ff"></i>DNp02 / DNp04 / DNp11（多突触下游）</div>
-      <div class="row"><i style="background:#455263"></i>其余 ~5.9 万神经元（真实解剖坐标）</div>
+      <div class="row"><i style="background:#455263"></i>背景灰点＝抽样子集（性能）；<br>&nbsp;&nbsp;&nbsp;&nbsp;关键神经元与发放点全量显示</div>
     </div>
     <div id="ctl">
       <div class="grp">
@@ -80,6 +81,12 @@
           <input type="range" id="tmax" min="5" max="170" step="5" value="40"></label>
         <label>触发所需脉冲数（100ms 内）<output id="o-need">1</output>
           <input type="range" id="need" min="1" max="4" step="1" value="1"></label>
+      </div>
+      <div class="grp">
+        <label style="display:flex;align-items:center;gap:7px;cursor:pointer">
+          <input type="checkbox" id="cb3d" checked style="accent-color:#39d0ff">
+          显示 3D 脑（卡顿就关掉，游戏与读数不受影响）
+        </label>
       </div>
       <div class="grp btns">
         <button id="btn-reset">重置脑状态</button>

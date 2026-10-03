@@ -21,6 +21,15 @@
 """
 from __future__ import annotations
 
+# ⚠️ 必须在 import torch 之前锁线程数。这个仿真的热点是**成千上万个极小的
+# 张量操作**（一次 index_add、一次 346 元素的 gather），torch 默认按逻辑核数
+# 开满线程池，每个小操作都要唤醒并自旋等待 —— 实测 16 线程时 CPU 时间
+# 2.76 ms/tick(约 3.6 个核)却比单线程的 0.57 ms/tick(1.0 个核)**更慢**。
+import os
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import argparse
 import json
 import pathlib
@@ -191,6 +200,10 @@ class Session:
                 gs[f"{nm}_{side}"] = t
                 if side in ("left", "right"):
                     self.lr.append((f"{nm}_{side}", t))
+        # 堆成一个矩阵，逐 tick 只做一个操作（而不是每群一个 int() 同步）
+        self.lr_sizes = [int(t.numel()) for _, t in self.lr]
+        self.lr_stack = (torch.cat([t for _, t in self.lr]) if self.lr
+                         else torch.zeros(0, dtype=torch.long, device=self.base.device))
         return gs
 
     def _weights_to_dn01(self) -> dict:
@@ -298,17 +311,26 @@ class Session:
             cidx = torch.cat(idx)
             pvec = torch.cat(pv)
             dn01, dn04 = self.g["DNp01"], self.g["DNp04"]
-            lit_hits: set[int] = set()
+            # 累加全部留在张量里做，循环内**一次都不回 Python**
+            acc_dn = torch.zeros((), device=self.brain.device)
+            acc_dn04 = torch.zeros((), device=self.brain.device)
+            acc_lr = torch.zeros(len(self.lr), device=self.brain.device)
+            acc_lit = torch.zeros(self.lit_assets.numel(), device=self.brain.device)
             for _ in range(ticks):
                 self.brain.step(clamp=(cidx, pvec))
-                self.dn_tick.append(int(self.brain.S[dn01].sum()))
-                self.dn04_tick.append(int(self.brain.S[dn04].sum()))
-                self.lr_tick.append({nm: int(self.brain.S[t].sum()) for nm, t in self.lr})
-                # 本次请求覆盖的所有 tick 里，只要放过脉冲就标记（前端按帧点亮）
-                lit_hits.update(self.brain.S[self.lit_assets].nonzero(
-                    as_tuple=False).flatten().tolist())
+                s_ = self.brain.S
+                acc_dn += s_[dn01].sum()
+                acc_dn04 += s_[dn04].sum()
+                acc_lr += s_[self.lr_stack].float().view(len(self.lr_sizes), -1).sum(1)
+                acc_lit += s_[self.lit_assets].float()
                 self.ticks_total += 1
+            dn_now = int(acc_dn)
+            self.dn_tick.append(dn_now)
+            self.dn04_tick.append(int(acc_dn04))
+            lit_hits = {i for i, v in enumerate(acc_lit.tolist()) if v > 0}
             lc4_rate = float(self.brain.S[cidx].float().mean())
+            lr_row = dict(zip([n for n, _ in self.lr], [int(v) for v in acc_lr.tolist()]))
+            self.lr_tick.append(lr_row)
             # 回传**资产索引**（前端才能查到解剖坐标）
             vz = self.brain.S[self.viz_idx]
             recent = sum(self.dn_tick)

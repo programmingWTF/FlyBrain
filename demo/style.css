@@ -10,6 +10,8 @@ header{display:flex;align-items:baseline;gap:16px;padding:10px 16px;
 header h1{margin:0;font-size:15px;font-weight:600;letter-spacing:.3px}
 header h1 span{color:var(--dn)}
 #stat{color:var(--dim);font-size:11.5px;font-variant-numeric:tabular-nums}
+#fpsbox{margin-left:auto;color:var(--dim);font-size:11.5px;white-space:nowrap}
+#fpsbox b{color:#9fe6ff;font-variant-numeric:tabular-nums}
 main{display:grid;grid-template-columns:minmax(420px,46%) 1fr;
   height:calc(100vh - 49px)}
 #left{position:relative;border-right:1px solid var(--line);

@@ -16,7 +16,7 @@ const TICK_S = 0.02;               // 脑的时钟：20ms/tick
 const FLAP_COOLDOWN = 0.14;        // 两次拍翅最小间隔（秒）
 
 const P = { s50: 15, s50size: 30, rad: 0.05, spd: 1.0, need: 1, graph: 'real',
-            mode: 'flappy', tmax: 40 };
+            mode: 'flappy', tmax: 40, show3d: true };
 // DNp01 发放需要每 tick 净输入 Σw·p >= (1-leak)*thr/gain = 0.0604。
 // 这个"有效驱动 / 阈值"由后端按每个细胞到 DNp01 的真实突触权重算出来（resp.eff / resp.need），
 // 就是仪表里那根黄色阈值线。scripts/loom_retino_coverage.py 验证过它能精确预测 cliff。
@@ -88,6 +88,9 @@ function resetGame() {
   G.started = false; G.readyT = performance.now();
   G.y = 300; G.vy = 0; G.pipes = []; G.dead = false;
   G.deadT = 0; G.acc = 0; G.cooldown = 0; G.spawnT = 0; G.hist = [];
+  // 每一局都要归零。之前一次改动把这行弄丢了，导致撞死后分数跨局累加、
+  // "最高"也跟着变成累计值 —— 看起来就是得分算错。
+  G.score = 0;
   if (P.mode !== 'flappy') {
     G.y = 310; newThreat();
   } else {
@@ -610,16 +613,25 @@ function init3D() {
 
   const coords = S.coords;                       // (N,3) 归一化解剖坐标
   const N = coords.length / 3;
+  // 背景点抽稀：全量 5.9 万个半透明点每帧混合排序，在核显上只要 13fps。
+  // 这里固定抽一个子集当"背景"，但**关键神经元（LC4/DN*）一个不丢** ——
+  // 抽稀只影响装饰性的灰点，不影响任何被解读的对象。
+  const BG_MAX = 14000;
+  const key = new Set(S.info.lit.map(c => c.asset));
   const keep = [];
   for (let i = 0; i < N; i++) {
     if (Math.abs(coords[i * 3]) + Math.abs(coords[i * 3 + 1]) + Math.abs(coords[i * 3 + 2]) > 1e-6)
       keep.push(i);
   }
+  const stride = Math.max(1, Math.ceil(keep.length / BG_MAX));
+  const kept2 = keep.filter((a, i) => key.has(a) || i % stride === 0);
+  S.bgShown = kept2.length;
+  const keepFinal = kept2;
   const pos = new Float32Array(keep.length * 3);
   const col = new Float32Array(keep.length * 3);
   const asset2pt = new Int32Array(N).fill(-1);
   const base = new THREE.Color(0x455263), tmp = new THREE.Color();
-  keep.forEach((a, k) => {
+  keepFinal.forEach((a, k) => {
     asset2pt[a] = k;
     pos[k * 3] = coords[a * 3]; pos[k * 3 + 1] = coords[a * 3 + 1]; pos[k * 3 + 2] = coords[a * 3 + 2];
     base.toArray(col, k * 3);
@@ -641,6 +653,23 @@ function init3D() {
   const pts = new THREE.Points(geo, mat);
   const grp = new THREE.Group(); grp.add(pts); scene.add(grp);
 
+  // 发放中的神经元用**独立的小覆盖点云**画，而不是每帧改写整张底色缓冲。
+  // 底色缓冲是 59,548×3 float ≈ 2.1MB；每帧重传就是 ~130MB/s 的上传，
+  // 这才是卡顿的来源。覆盖层每帧只传实际发放的那几百个点（约 24KB）。
+  function makeOverlay(max, size, color) {
+    const pg = new THREE.BufferGeometry();
+    pg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(max * 3), 3));
+    pg.setDrawRange(0, 0);
+    const pm = new THREE.PointsMaterial({ size, color, transparent: true,
+                                          opacity: 0.95, depthWrite: false,
+                                          blending: THREE.AdditiveBlending });
+    const po = new THREE.Points(pg, pm);
+    grp.add(po);
+    return { geo: pg, max, po };
+  }
+  const ovLit = makeOverlay(400, 0.055, 0xffffff);
+  const ovViz = makeOverlay(1500, 0.022, 0x8fd0ff);
+
   // 自写轨道控制（不依赖 addons，避免 import 路径问题）
   const orbit = { rx: -0.3, ry: 0.4, zoom: 2.6, drag: null };
   cv.addEventListener('pointerdown', e => { orbit.drag = [e.clientX, e.clientY]; });
@@ -657,7 +686,8 @@ function init3D() {
     orbit.zoom = Math.max(0.6, Math.min(6, orbit.zoom * (1 + e.deltaY * 0.0012)));
   }, { passive: false });
 
-  three = { renderer, scene, camera, grp, geo, col, base, asset2pt, orbit,
+  three = { renderer, scene, camera, grp, geo, col, base, asset2pt, orbit, ovLit, ovViz,
+            coords: S.coords,
             litAsset: S.info.lit.map(c => c.asset), litType: S.info.lit.map(c => c.type) };
   resize();
 }
@@ -669,42 +699,51 @@ function resize() {
   three.camera.updateProjectionMatrix();
 }
 
-const HOT = new THREE.Color();
+function fillOverlay(ov, assetIdxList) {
+  const T = three, arr = ov.geo.attributes.position.array;
+  let n = 0;
+  for (const a of assetIdxList) {
+    if (n >= ov.max) break;
+    if (a == null || a < 0) continue;
+    arr[n * 3] = T.coords[a * 3]; arr[n * 3 + 1] = T.coords[a * 3 + 1];
+    arr[n * 3 + 2] = T.coords[a * 3 + 2];
+    n++;
+  }
+  ov.geo.setDrawRange(0, n);
+  ov.geo.attributes.position.needsUpdate = true;
+}
+
 function draw3D() {
   const T = three, r = S.resp;
-  const arr = T.geo.attributes.color.array;
-  // 每帧先回到"身份色"：LC4 橙 / DNp01 红 / 其余灰蓝
-  arr.set(T.col);
   if (r) {
-    for (const a of r.viz_spike) {
-      const k = T.asset2pt[a]; if (k < 0) continue;
-      HOT.setRGB(0.55, 0.75, 1.0); HOT.toArray(arr, k * 3);
-    }
-    r.lit_spike.forEach(li => {
-      const a = T.litAsset[li]; if (a === undefined) return;
-      const k = T.asset2pt[a]; if (k < 0) return;
-      const ty = T.litType[li];
-      const b = ty === 'DNp01' ? [1.6, 0.25, 0.4] : ty === 'LC4' ? [1.5, 0.8, 0.2] : [0.4, 1.5, 1.9];
-      HOT.setRGB(b[0], b[1], b[2]); HOT.toArray(arr, k * 3);
-    });
+    // 底色云完全不动，只挪覆盖层
+    fillOverlay(T.ovViz, r.viz_spike);
+    fillOverlay(T.ovLit, (r.lit_spike || []).map(i => T.litAsset[i]));
+  } else {
+    T.ovLit.geo.setDrawRange(0, 0); T.ovViz.geo.setDrawRange(0, 0);
   }
-  T.geo.attributes.color.needsUpdate = true;
   T.grp.rotation.set(T.orbit.rx, T.orbit.ry, 0);
   T.camera.position.z = T.orbit.zoom;
-  T.renderer.render(T.scene, T.camera);
+  T._n = (T._n || 0) + 1;
+  if (T._n % 2 === 0) T.renderer.render(T.scene, T.camera);   // 3D 半速即可
 }
 
 // ---------------------------------------------------------------- HUD
+const _hudCache = {};
+function setTxt(id, v) {                       // 值没变就不碰 DOM（避免每帧重排）
+  if (_hudCache[id] === v) return;
+  _hudCache[id] = v; $(id).textContent = v;
+}
 function hud() {
   const r = disp();
-  $('h-theta').textContent = r ? r.theta_deg.toFixed(1) + '°' : '–';
-  $('h-dtheta').textContent = r ? r.dtheta_dps.toFixed(0) + ' °/s' : '–';
-  $('h-tau').textContent = r ? r.tau_s.toFixed(2) + ' s' : '–';
-  $('h-lc4').textContent = r ? (r.lc4_rate * 50).toFixed(1) + ' Hz' : '–';
-  const dn = $('h-dn');
-  dn.textContent = r ? r.dn01_recent + ' 个脉冲' : '–';
-  dn.style.color = r && r.dn01_recent > 0 ? '#ff2d55' : '';
-  $('h-score').textContent = G.score + ' / ' + G.best;
+  setTxt('h-theta', r ? r.theta_deg.toFixed(1) + '°' : '–');
+  setTxt('h-dtheta', r ? r.dtheta_dps.toFixed(0) + ' °/s' : '–');
+  setTxt('h-tau', r ? r.tau_s.toFixed(2) + ' s' : '–');
+  setTxt('h-lc4', r ? (r.lc4_rate * 50).toFixed(1) + ' Hz' : '–');
+  setTxt('h-dn', r ? r.dn01_recent + ' 个脉冲' : '–');
+  const dn = $('h-dn'), c = r && r.dn01_recent > 0 ? '#ff2d55' : '';
+  if (dn.style.color !== c) dn.style.color = c;
+  setTxt('h-score', G.score + ' / ' + G.best);
 }
 
 // ---------------------------------------------------------------- UI
@@ -719,6 +758,12 @@ function initUI() {
   bind('s50', 's50', 'o-s50'); bind('rad', 'rad', 'o-rad', v => v.toFixed(3));
   bind('spd', 'spd', 'o-spd', v => v.toFixed(1)); bind('need', 'need', 'o-need');
   bind('tmax', 'tmax', 'o-tmax');
+  const cb = $('cb3d');
+  if (cb) cb.addEventListener('change', () => {
+    P.show3d = cb.checked;
+    $('brain').style.display = cb.checked ? 'block' : 'none';
+    $('legend').style.display = cb.checked ? 'block' : 'none';
+  });
   document.querySelectorAll('input[name=mode]').forEach(el => {
     el.addEventListener('change', () => {
       P.mode = el.value; G.score = 0; G.miss = 0;
@@ -751,9 +796,16 @@ function initUI() {
 // ---------------------------------------------------------------- 主循环
 const DBG = { frames: 0, err: null, lastTs: null, G, P, S };
 window.__dbg = DBG;                 // 排障用：控制台读 __dbg.frames / __dbg.err
+const PERF = { f: 0, last: 0, fps: 0 };
 function loop(ts) {
   requestAnimationFrame(loop);
   DBG.frames++; DBG.lastTs = ts;
+  PERF.f++;
+  if (ts - PERF.last > 500) {                 // 每半秒报一次真实帧率
+    PERF.fps = PERF.f * 1000 / (ts - PERF.last); PERF.f = 0; PERF.last = ts;
+    const el = $('h-fps');
+    if (el) el.textContent = PERF.fps.toFixed(0) + ' fps';
+  }
   try {
     const now = ts / 1000;
     const dt = G.last ? Math.min(0.05, now - G.last) : 0;
@@ -765,7 +817,9 @@ function loop(ts) {
     // 脑就长期跑不满实时（实测只剩 24%）。
     const ticks = Math.floor(G.acc / TICK_S);
     if (ticks > 0 && stepBrain(Math.min(ticks, 12))) G.acc -= ticks * TICK_S;
-    drawGame(); drawScope(); draw3D(); hud();
+    drawGame(); drawScope();
+    if (P.show3d) draw3D();
+    hud();
   } catch (e) {
     DBG.err = (e && e.stack) ? e.stack : String(e);
   }
