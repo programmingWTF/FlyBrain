@@ -345,20 +345,38 @@ function drawSky(g) {
   }
 }
 
-function drawPipeSprite(g, x, yTop, hgt) {
-  const capW = PIPE_W + 10, capH = 30;
+/** 画一段管体。
+ *
+ *  ⚠️ `capSide` 只允许画在**远离缺口**的那一端，绝不能画在缺口那一侧。
+ *  这里踩过一个真 bug（用户实测："碰到管子不判定失败，下端更明显"）：
+ *  原来两端都不管不顾地画 `capH=30` 的管帽，而管帽**正好贴在缺口那一侧**，于是
+ *      上管帽覆盖 [top-30, top]        下管帽覆盖 [top+168-30, top+168+...]
+ *  也就是说画出来的管子整整探进缺口 30px（左右还各多 5px），
+ *  而碰撞判定（physics()）只认管体 `[top, top+168]`。
+ *  → **画出来的缺口比判定用的缺口小 30px，鸟压着帽子飞过去不算撞。**
+ *  两端都错，且视觉上不对称，所以看起来像"上下样式不同"。
+ *
+ *  玩法判定本身一直是对的（缺口 = 168px，与 scripts/flappy_bench.py 逐字一致），
+ *  错的是"画出来的 ≠ 判定的"。修法是让管帽只出现在缺口**反面**，
+ *  这样画出来的缺口就等于判定用的缺口，不用去动任何物理与碰撞代码。
+ */
+function drawPipeSprite(g, x, yTop, hgt, withCap) {
+  const capH = 30;
   const body = g.createLinearGradient(x, 0, x + PIPE_W, 0);
   body.addColorStop(0, '#8ce350'); body.addColorStop(0.25, '#74bf2e');
   body.addColorStop(0.85, '#4e8a1c'); body.addColorStop(1, '#3d6d16');
   g.fillStyle = body; g.fillRect(x, yTop, PIPE_W, hgt);
   g.strokeStyle = '#2f5212'; g.lineWidth = 2; g.strokeRect(x, yTop, PIPE_W, hgt);
-  const cy = yTop >= 0 ? yTop : yTop + hgt;          // 管帽贴在缺口那一侧
-  const capY = yTop >= 0 ? cy - capH : cy;
-  const cg = g.createLinearGradient(x - 5, 0, x + capW - 5, 0);
-  cg.addColorStop(0, '#96ee58'); cg.addColorStop(0.3, '#74bf2e');
-  cg.addColorStop(1, '#3d6d16');
-  g.fillStyle = cg; g.fillRect(x - 5, capY, capW, capH);
-  g.strokeRect(x - 5, capY, capW, capH);
+  if (withCap) {
+    // 管帽画在**远端**：yTop >= 0（下管）时贴在管体底部；否则（上管）贴在管体顶部
+    const capW = PIPE_W + 10;
+    const capY = yTop >= 0 ? yTop : yTop + hgt - capH;
+    const cg = g.createLinearGradient(x - 5, 0, x + capW - 5, 0);
+    cg.addColorStop(0, '#96ee58'); cg.addColorStop(0.3, '#74bf2e');
+    cg.addColorStop(1, '#3d6d16');
+    g.fillStyle = cg; g.fillRect(x - 5, capY, capW, capH);
+    g.strokeRect(x - 5, capY, capW, capH);
+  }
   g.lineWidth = 1;
 }
 
@@ -444,8 +462,10 @@ function drawGame() {
   if (P.mode === 'flappy') {
     drawSky(g);
     for (const p of G.pipes) {
-      drawPipeSprite(g, p.x, 0, p.top);
-      drawPipeSprite(g, p.x, p.top + GAP, G.H - GROUND - p.top - GAP);
+      // 管帽只画在远离缺口的那一端（见 drawPipeSprite 的说明）：
+      // 上管 = 屏幕顶那端；下管 = 地面那端。
+      drawPipeSprite(g, p.x, 0, p.top, true);
+      drawPipeSprite(g, p.x, p.top + GAP, G.H - GROUND - p.top - GAP, true);
     }
     drawGround(g);
     drawBirdSprite(g);
