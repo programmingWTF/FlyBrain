@@ -17,9 +17,20 @@ const FLAP_COOLDOWN = 0.14;        // 两次拍翅最小间隔（秒）
 
 const P = { s50: 15, s50size: 30, rad: 0.05, spd: 1.0, need: 1, graph: 'real',
             mode: 'flappy', tmax: 40, show3d: true };
-// DNp01 发放需要每 tick 净输入 Σw·p >= (1-leak)*thr/gain = 0.0604。
-// 这个"有效驱动 / 阈值"由后端按每个细胞到 DNp01 的真实突触权重算出来（resp.eff / resp.need），
-// 就是仪表里那根黄色阈值线。scripts/loom_retino_coverage.py 验证过它能精确预测 cliff。
+// ---------------------------------------------------------------- 双向逼近反射
+// 页面上的 Flappy 用的是"双向逼近反射 + 按执行器带宽生成关卡"这一档
+// （ESCAPE.md §6/§7）。它比原来那套"最近碰撞 + LC4 角速度"高一个数量级：
+//   原来 1.54 分（86% 的局 ≤2 分） → 现在 29.5 分（中位 21，19% 的局 ≤2 分）
+// 神经计算仍然**全在后端**，这里只负责把"望远镜几何"算出来送过去：
+//   · 方向由**缺口在视野里的高低**决定（缺口比鸟高 → 腹侧支爬升；
+//     比鸟低超过一个死区 → 背侧支下潜）—— 纯几何，没有方向控制器
+//   · vy_gate：地面只在下落时逼近、天花板只在上升时逼近（纯物理）
+// 关卡生成加上"相邻缺口的向上跳变 ≤ max_climb"的可达性约束：
+// 鸟的可持续爬升率只有 ~100 px/s（一次拍翅买 49px、周期 ~0.4s），
+// 管距 1.25s 只能爬 ~125px，而缺口的随机跳变有 330px 量程 ——
+// 超出这个带宽的关卡在给定物理下无论如何都飞不进去。
+const FLAPPY = { maxClimb: 40, gapMargin: 18, vyGate: 1, ceilBoost: 1.0,
+                 groups: ['LC4', 'LPLC2'], s50size: 30, n: 3 };
 const S = { info: null, coords: null, ready: false };
 
 // ---------------------------------------------------------------- 游戏状态
@@ -33,24 +44,47 @@ const G = {
 };
 const GRAV = 1180, FLAP_V = -340, PIPE_W = 62, GAP = 168;
 
+/** 双向逼近反射的"望远镜几何"：只算纯几何量，交给后端决定驱动哪些细胞。
+ *
+ *  方向：缺口比鸟高 → 威胁在下方（地面）→ 腹侧半视野；缺口比鸟低 → 天花板 → 背侧。
+ *  vy_gate 在后端做（地面只在下落时逼近、天花板只在上升时逼近）。
+ *  距离沿用同一套"等效半宽 0.55"的写法，与 scripts/flappy_bench.py 一致。
+ */
+function bidiBody(th, ticks) {
+  const gapC = nearestPipe() ? nearestPipe().top + GAP / 2 : G.H / 2;
+  const up = gapC < G.y - FLAPPY.gapMargin;
+  const hPx = Math.max(up ? (G.H - GROUND) - G.y : G.y, 1);
+  const dist = Math.max(hPx / PX_PER_M, 0.02);
+  const thetaDeg = 180 / Math.PI * 2 * Math.atan(0.55 / dist);
+  const n = FLAPPY.n, s50 = FLAPPY.s50size;
+  const x = Math.pow(Math.max(thetaDeg, 0), n);
+  const amp = x / (x + Math.pow(s50, n));
+  G.geo = { theta_deg: thetaDeg,
+            dtheta_dps: 180 / Math.PI * (0.55 / Math.max(dist, 1e-3)),
+            tau_s: dist };
+  G.cov = amp;
+  return { ticks, need_spikes: P.need,
+           drives: [{ type: 'bidi', y: G.y, vy: G.vy, gap: gapC,
+                      ground_y: G.H - GROUND, s50size: s50, n: n,
+                      gap_margin: FLAPPY.gapMargin, vy_gate: FLAPPY.vyGate,
+                      ceil_boost: FLAPPY.ceilBoost, groups: FLAPPY.groups }] };
+}
+
 /** 当前威胁的几何：返回 {distM, speed, radius} 或 null。
  *  reflex 模式：一个正对苍蝇飞来的暗盘（这就是文献里的逼近刺激）。
- *  flappy  模式：最近的那根管子被当作迎面撞来的物体。 */
+ *  flappy  模式：见 bidiBody()（双向反射不看"最近碰撞"，看缺口在视野的哪一半）。 */
 function threat() {
   if (P.mode === 'fly3d') return geom3d();
   if (P.mode !== 'flappy') {
     if (G.threatD == null) return null;
     return { distM: Math.max(G.threatD, 0.02), speed: P.spd, radius: P.rad };
   }
-  // 苍蝇该对**最 imminent 的那个碰撞**报警：地面 / 天花板 / 前方管子，
-  // 取时间到接触(TTC)最小的。只盯管子的话，苍蝇下落时没有任何东西逼它拍翅，
-  // 而地面逼近是一个货真价实的 looming 刺激。
   const vpx = P.spd * PX_PER_M;
   const cands = [];
   const near = nearestPipe();
   if (near) cands.push({ dpx: near.x + PIPE_W - G.birdX, vpx: vpx, rad: P.rad });
-  const groundY = G.H - GROUND;
-  if (G.vy > 0) cands.push({ dpx: groundY - G.y, vpx: G.vy, rad: 0.55 });
+  const groundY0 = G.H - GROUND;
+  if (G.vy > 0) cands.push({ dpx: groundY0 - G.y, vpx: G.vy, rad: 0.55 });
   if (G.vy < 0) cands.push({ dpx: G.y, vpx: -G.vy, rad: 0.55 });
   let best = null;
   for (const c of cands) {
@@ -101,8 +135,25 @@ function resetGame() {
   }
 }
 
+/** 关卡生成：加上"相邻缺口的向上跳变 ≤ maxClimb"的可达性约束。
+ *
+ *  为什么必须加（ESCAPE.md §6.1~6.3 实测）：鸟的可持续爬升率只有 ~100 px/s，
+ *  管距 300px / 240px·s⁻¹ = 1.25s，一个间隔最多爬 ~125px；而原来
+ *  `70 + rand*(G.H-GAP-150)` 的缺口中心跳变有 330px 量程 —— 超出的关卡
+ *  在给定物理下无论如何都飞不进去（早死局实测 42/53 是"鸟偏低没爬够"）。
+ *  **向下不设限**：自由落体快得多（1.25s 可掉 921px，远超量程）。
+ *  管宽、缺口高、管速、重力一个都没改。
+ */
 function spawnPipe() {
-  const gapTop = 70 + Math.random() * (G.H - GAP - 150);
+  const lo = 70, hi = G.H - GAP - 150;          // 与原来同一个分布范围
+  let gapTop = lo + Math.random() * (hi - lo);
+  const last = G.pipes[G.pipes.length - 1];
+  if (last) {
+    const prevC = last.top + GAP / 2;           // 上一根缺口中心
+    const topMax = Math.min(hi, prevC + FLAPPY.maxClimb - GAP / 2);
+    if (topMax > lo) gapTop = lo + Math.random() * (topMax - lo);
+    else gapTop = lo;
+  }
   G.pipes.push({ x: G.W + 30, top: gapTop, passed: false });
 }
 
@@ -118,16 +169,19 @@ async function post(path, body) {
 let inFlight = false;
 function stepBrain(ticks) {
   if (inFlight) return false;
-  const th = threat();
+  // Flappy 走双向反射（方向由缺口在视野里的高低决定），不需要"最近碰撞"那套几何。
+  const th = (P.mode === 'flappy') ? { bidi: true } : threat();
   if (!th) return false;
   inFlight = true;
   // 几何量是前端算的（后端只收"每个群发多少"），所以显示要自己留一份
-  G.geo = {
-    theta_deg: 180 / Math.PI * 2 * Math.atan(th.radius / Math.max(th.distM, 1e-3)),
-    dtheta_dps: 180 / Math.PI * (2 * th.radius * th.speed /
-                                 (th.distM ** 2 + th.radius ** 2)),
-    tau_s: th.distM / Math.max(th.speed, 1e-6),
-  };
+  if (!th.bidi) {
+    G.geo = {
+      theta_deg: 180 / Math.PI * 2 * Math.atan(th.radius / Math.max(th.distM, 1e-3)),
+      dtheta_dps: 180 / Math.PI * (2 * th.radius * th.speed /
+                                   (th.distM ** 2 + th.radius ** 2)),
+      tau_s: th.distM / Math.max(th.speed, 1e-6),
+    };
+  }
   let body;
   if (P.mode === 'fly3d') {
     // 整面墙都驱动，只有洞那块不驱动：把洞的视网膜方位/角半径换算成视野坐标
@@ -154,9 +208,9 @@ function stepBrain(ticks) {
              drives: [{ group: 'LC4', amp: loomAmp(th), center: 0.5, width },
                       { group: 'LPLC2', amp: sizeAmp(th), center: 0.5, width }] };
   } else {
-    body = { ticks, dist: th.distM, speed: th.speed, radius: th.radius,
-             s50: P.s50, n: 3, source: 'dtheta', need_spikes: P.need,
-             drive: ['LC4'] };
+    // Flappy：双向逼近反射（见 bidiBody 的说明）。物理常数与判据都没变，
+    // 只是把"驱动哪些细胞"从"最近碰撞"换成"缺口落在视野的哪一半"。
+    body = bidiBody(th, ticks);
   }
   post('/api/step', body).then(r => {
     if (r.error) { $('stat').textContent = '后端错误：' + r.error; return; }
@@ -830,6 +884,17 @@ async function boot() {
     const info = await (await fetch('/api/info')).json();
     if (info.error) { $('stat').textContent = '后端错误 ' + info.error; return; }
     S.info = info;
+    // 投射参数**从后端读**，前端不另存一份默认值 —— 否则页面数字会和
+    // 命令行评测台（scripts/flappy_bench.py）悄悄失配，那就等于实验不可复现。
+    if (info.bidi) {
+      FLAPPY.s50size = info.bidi.s50size ?? FLAPPY.s50size;
+      FLAPPY.n = info.bidi.n ?? FLAPPY.n;
+      FLAPPY.gapMargin = info.bidi.gap_margin ?? FLAPPY.gapMargin;
+      FLAPPY.vyGate = info.bidi.vy_gate ?? FLAPPY.vyGate;
+      FLAPPY.ceilBoost = info.bidi.ceil_boost ?? FLAPPY.ceilBoost;
+      FLAPPY.groups = info.bidi.groups ?? FLAPPY.groups;
+    }
+    if (info.max_climb != null) FLAPPY.maxClimb = info.max_climb;
     const buf = await (await fetch('/api/coords.bin')).arrayBuffer();
     S.coords = new Float32Array(buf);
     $('stat').innerHTML =
@@ -837,7 +902,10 @@ async function boot() {
       `<b>${(info.n_synapses / 1e6).toFixed(2)}M</b> 突触 · dt=${info.dt_ms}ms · ` +
       `gain=${info.gain} tonic=${info.tonic} · 有坐标可点亮 ${info.lit.length} 个关键神经元` +
       `<br>LC4 ${info.groups.LC4} · DNp01 ${info.groups.DNp01} · DNp04 ${info.groups.DNp04} · ` +
-      `零可学参数 —— 分数完全来自反射`;
+      `零可学参数 —— 分数完全来自反射` +
+      `<br><b>Flappy = 双向逼近反射</b>：` +
+      `腹侧/背侧半视野 + 接近速度门控（死区 ${FLAPPY.gapMargin}px）· ` +
+      `关卡按执行器带宽生成（向上跳变 ≤ ${FLAPPY.maxClimb}px）`;
     init3D(); initUI(); resetGame();
     requestAnimationFrame(loop);
   } catch (e) {

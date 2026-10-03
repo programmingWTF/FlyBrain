@@ -32,6 +32,7 @@ for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 
 import argparse
 import json
+import math
 import pathlib
 import subprocess
 import sys
@@ -52,6 +53,17 @@ from fpv import looming                              # noqa: E402
 from fpv.spiking_brain import SpikingBrain           # noqa: E402
 
 GAIN, TONIC = 3.0, 0.0            # 带载标定过的工作点
+# ---- 游戏几何（必须与 demo/app.js 的常数一致；双向投射要用）----
+G_H = 620.0                       # 画布高
+GROUND = 92.0                     # 地面高度
+GROUND_Y = G_H - GROUND           # 地面线 y = 528
+PX_PER_M = 240.0                  # 世界尺度（= app.js 的 PX_PER_M）
+# ---- 双向逼近反射的投射参数（与 scripts/flappy_bench.py 的默认值一致）----
+BIDI = dict(s50size=30.0, n=3.0, gain=1.0, gap_margin=18.0, vy_gate=1,
+            ceil_boost=1.0, groups=["LC4", "LPLC2"])
+#: 相邻缺口的向上跳变上限（px）—— 与 bench 的 max_climb 一致：
+#: 这是"关卡按执行器带宽生成"那一条（ESCAPE.md 6.3）
+MAX_CLIMB = 40.0
 WINDOW = 5                        # 100ms = 5 个 20ms tick
 VIZ_SAMPLE = 12000                # 全脑"点亮"用的随机抽样规模
 LIT_TYPES = ["LC4", "DNp01", "DNp04", "LC10a", "DNp02", "DNp11"]
@@ -126,6 +138,8 @@ class Session:
         self.g2 = dict(self.g)
         self.g2.update(self._retino_groups())
         self.w_dn01 = self._weights_to_dn01()
+        self._wmap_cache: dict = {}
+        self.last_plan: dict = {}
         self.reset()
 
     def _build_lit(self):
@@ -251,6 +265,115 @@ class Session:
         self.lr_tick = deque(maxlen=WINDOW)
         self.ticks_total = 0
 
+    # ---- 感觉投射（与 scripts/flappy_bench.py 同一套公式，不许各写一遍）
+    def _wmap(self, gname: str) -> torch.Tensor:
+        """该群逐细胞到 DNp01 的权重（每只细胞口径，与 loom_ventral_probe 一致）。"""
+        if gname not in self._wmap_cache:
+            self._wmap_cache[gname] = self.w_dn01[gname]
+        return self._wmap_cache[gname]
+
+    def _bidi_plan(self, b: dict) -> tuple[list, list, float]:
+        """**双向逼近反射**：视野哪一半 + 是否正在靠近 → 驱动腹侧或背侧半群。
+
+        与 `scripts/flappy_bench.py` 的 `BiDirectionalProjection` 逐行对应：
+          · 威胁量 = 2·atan(0.55 / 距离) 的角尺寸，过 LPLC2 的 Naka-Rushton(s50size)
+          · 方向：缺口比鸟高一个死区 → 腹侧（u<0.5）；比鸟低一个死区 → 背侧（u>=0.5）
+          · vy_gate：地面只在下落时逼近、天花板只在上升时逼近（纯物理）
+          · **整半招募**（不是平滑窗）—— 实测平滑斜坡窗只有 need 的 53%，不发放
+        这几条都是 ESCAPE.md §7 量出来的，不是这里另调的参数。
+        """
+        y = float(b["y"])
+        vy = float(b["vy"])
+        gap = float(b["gap"])
+        s50size = float(b.get("s50size", 30.0))
+        n = float(b.get("n", 3.0))
+        margin = float(b.get("gap_margin", 18.0))
+        vy_gate = int(b.get("vy_gate", 1))
+        boost = float(b.get("ceil_boost", 1.0))
+        groups = b.get("groups") or ["LC4", "LPLC2"]
+
+        # ---- 方向（纯几何）
+        if gap < y - margin:
+            up = True
+        elif gap > y + margin:
+            up = False
+        else:
+            self.last_plan = dict(branch="aligned", theta=0.0, amp=0.0, eff=0.0)
+            return [], [], 0.0                      # 已对准：不驱动
+        # ---- vy_gate：只有正在朝那一面靠近才是逼近刺激
+        if vy_gate and ((up and vy <= 0) or ((not up) and vy >= 0)):
+            self.last_plan = dict(branch="gated", theta=0.0, amp=0.0, eff=0.0)
+            return [], [], 0.0
+        # ---- 角尺寸（地面用离地高度，天花板用离顶高度）
+        h_px = (float(b["ground_y"]) - y) if up else y
+        h_px = max(h_px, 1.0)
+        dist = max(h_px / PX_PER_M, 0.02)
+        theta = math.degrees(2 * math.atan2(0.55, dist))
+        if not up:
+            theta *= boost
+        x = max(theta, 0.0) ** n
+        amp = float(b.get("gain", 1.0)) * (x / (x + s50size ** n))
+        # ---- 整半招募
+        idx, pv, eff = [], [], 0.0
+        for gname in groups:
+            u = self.retino_u[gname]
+            m = (u >= 0.5) if not up else (u < 0.5)
+            t = self.retino_u_idx[gname][m]
+            p = torch.full((int(m.sum()),), amp, device=self.brain.device)
+            idx.append(t)
+            pv.append(p)
+            eff += float((self._wmap(gname)[m.cpu().numpy()] * amp).sum())
+        self.last_plan = dict(branch="ventral" if up else "dorsal",
+                              theta=round(theta, 1), amp=round(amp, 4),
+                              eff=round(eff, 5))
+        return idx, pv, eff
+
+    def _plan_drives(self, drives: list) -> tuple[list, list, float]:
+        """把请求里的驱动描述翻译成 (逐细胞索引, 逐细胞发放率, Σw·p)。
+
+        支持三种写法：
+          ["LC4", 0.8]                       整群同一个发放率（老写法）
+          {"group","amp","center","width",...} 视野高斯窗 / hole（老写法）
+          {"group","half":"ventral|dorsal","amp"}  整半招募（新：双向反射用）
+          {"type":"bidi", ...}               双向逼近反射（新）
+        """
+        idx: list = []
+        pv: list = []
+        eff = 0.0
+        for spec in drives:
+            if isinstance(spec, dict) and spec.get("type") == "bidi":
+                i2, p2, e2 = self._bidi_plan(spec)
+                idx += i2
+                pv += p2
+                eff += e2
+            elif isinstance(spec, dict) and "half" in spec:
+                gname = str(spec["group"])
+                u = self.retino_u[gname]
+                m = (u >= 0.5) if str(spec["half"]).startswith("d") else (u < 0.5)
+                t = self.retino_u_idx[gname][m]
+                amp = float(spec.get("amp", 1.0))
+                idx.append(t)
+                pv.append(torch.full((int(m.sum()),), amp, device=self.brain.device))
+                eff += float((self._wmap(gname)[m.cpu().numpy()] * amp).sum())
+            elif isinstance(spec, dict):
+                gname = str(spec["group"])
+                t = self.g2.get(gname, self.retino_u_idx[gname])
+                u = self.retino_u[gname]
+                amp, c, w = (float(spec.get(k, d)) for k, d in
+                             (("amp", 1.0), ("center", 0.5), ("width", 0.25)))
+                g = torch.exp(-((u - c) / max(w / 2.355, 1e-6)) ** 2 / 2.0)
+                shape = (1.0 - g) if spec.get("hole") else g
+                idx.append(t)
+                pv.append(shape * amp)
+                eff += float((self.w_dn01[gname] * shape * amp).sum())
+            else:
+                name, p = spec
+                t = self.g2[str(name)]
+                idx.append(t)
+                pv.append(torch.full((t.numel(),), float(p), device=self.brain.device))
+                eff += float(self.w_dn01[str(name)].sum()) * float(p)
+        return idx, pv, eff
+
     # ---- 主循环
     def step(self, req: dict) -> dict:
         """推进脑若干 tick。两种驱动写法：
@@ -284,32 +407,12 @@ class Session:
                          tau_s=round(tau_s, 3), drive=round(p, 4))
 
         with self.lock:
-            idx, pv = [], []
-            eff = 0.0
-            for spec in drives:
-                if isinstance(spec, dict):
-                    # 视野定位驱动。两种空间形状：
-                    #   高斯窗（默认）：威胁只覆盖视野的一小块
-                    #   hole：整面压过来的墙都驱动，只有"能穿过去的洞"那块不驱动
-                    #       —— 第一人称走廊版用这个，因为墙才是覆盖大部分视野的逼近物
-                    gname = str(spec["group"])
-                    t = self.g2.get(gname, self.retino_u_idx[gname])
-                    u = self.retino_u[gname]
-                    amp, c, w = (float(spec.get(k, d)) for k, d in
-                                 (("amp", 1.0), ("center", 0.5), ("width", 0.25)))
-                    g = torch.exp(-((u - c) / max(w / 2.355, 1e-6)) ** 2 / 2.0)
-                    shape = (1.0 - g) if spec.get("hole") else g
-                    idx.append(t)
-                    pv.append(shape * amp)
-                    eff += float((self.w_dn01[gname] * shape * amp).sum())
-                else:
-                    name, p = spec
-                    t = self.g2[str(name)]
-                    idx.append(t)
-                    pv.append(torch.full((t.numel(),), float(p), device=self.brain.device))
-                    eff += float(self.w_dn01[str(name)].sum()) * float(p)
-            cidx = torch.cat(idx)
-            pvec = torch.cat(pv)
+            idx, pv, eff = self._plan_drives(drives)
+            # 空驱动是合法状态（双向反射里"已对准"和"vy_gate 关掉"都会返回空）：
+            # 此时不钳制任何细胞，脑照常按自己的动力学跑。别去 cat 空列表。
+            clamp = None
+            if idx:
+                clamp = (torch.cat(idx), torch.cat(pv))
             dn01, dn04 = self.g["DNp01"], self.g["DNp04"]
             # 累加全部留在张量里做，循环内**一次都不回 Python**
             acc_dn = torch.zeros((), device=self.brain.device)
@@ -317,7 +420,7 @@ class Session:
             acc_lr = torch.zeros(len(self.lr), device=self.brain.device)
             acc_lit = torch.zeros(self.lit_assets.numel(), device=self.brain.device)
             for _ in range(ticks):
-                self.brain.step(clamp=(cidx, pvec))
+                self.brain.step(clamp=clamp)
                 s_ = self.brain.S
                 acc_dn += s_[dn01].sum()
                 acc_dn04 += s_[dn04].sum()
@@ -328,19 +431,22 @@ class Session:
             self.dn_tick.append(dn_now)
             self.dn04_tick.append(int(acc_dn04))
             lit_hits = {i for i, v in enumerate(acc_lit.tolist()) if v > 0}
-            lc4_rate = float(self.brain.S[cidx].float().mean())
+            lc4_rate = (float(self.brain.S[clamp[0]].float().mean()) if clamp is not None
+                        else 0.0)
             lr_row = dict(zip([n for n, _ in self.lr], [int(v) for v in acc_lr.tolist()]))
             self.lr_tick.append(lr_row)
             # 回传**资产索引**（前端才能查到解剖坐标）
             vz = self.brain.S[self.viz_idx]
             recent = sum(self.dn_tick)
             out = dict(
-                drive_max=float(max((float(d[1] if isinstance(d, (list, tuple))
-                                     else d.get("amp", 0.0)) for d in drives),
-                                    default=0.0)),
+                drive_max=round(float(self.last_plan.get("amp", 0.0)), 4)
+                if self.last_plan else
+                float(max((float(d[1] if isinstance(d, (list, tuple))
+                                 else d.get("amp", 0.0)) for d in drives), default=0.0)),
                 eff=round(eff, 5), need=round((1 - self.base.leak)
                                                * self.base.threshold
                                                / self.base.gain, 5),
+                plan=dict(self.last_plan),      # 双向投射：哪一支 / 角尺寸 / Σw·p
                 lc4_rate=round(lc4_rate, 4),
                 dn01_recent=recent, dn04_recent=sum(self.dn04_tick),
                 flap=bool(recent >= int(req.get("need_spikes", 1))),
@@ -364,6 +470,9 @@ class Session:
                     if k not in self.g},
             retino_axis=getattr(self, "retino_axis", None),
             lit=self.lit, r50=0.577,
+            # 前端要用这些常数复现引擎的关卡生成与双向投射（别在前端另写一套数）
+            bidi=dict(BIDI), max_climb=MAX_CLIMB,
+            geom=dict(g_h=G_H, ground=GROUND, ground_y=GROUND_Y, px_per_m=PX_PER_M),
         )
 
 
