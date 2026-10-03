@@ -261,10 +261,50 @@ function physics(dt) {
   for (const p of G.pipes) {
     const cx = Math.max(p.x, Math.min(G.birdX, p.x + PIPE_W));   // 矩形上最近的 x
     if ((G.birdX - cx) ** 2 > BIRD_R ** 2) continue;             // 水平还没够到
-    if (G.y - BIRD_R <= p.top || G.y + BIRD_R >= p.top + GAP) return die('撞上管子');
+    // 严格不等式才是与画面严格一致的那一组（这里来回错过三次，根因是像素/坐标混用）：
+    //   画出来的管子是像素块；块从索引 h 起、高 len，覆盖**坐标** [h, h+len)。
+    //   上管覆盖像素 [0, p.top+R] → 几何下沿坐标 p.top+R+1；
+    //   下管覆盖像素 [p.top+GAP-R-1, ...] → 几何上沿坐标 p.top+GAP-R-1。
+    //   圆周下沿 y+R、上沿 y-R，所以真的重叠 ⟺ 下面这两条。
+    //   写成 y-R <= p.top || y+R >= p.top+GAP 会让判定整体比画面小 1px，
+    //   表现就是用户报的【碰到柱子不死】。
+    // demo/verify_collision_exact.js 扫管子 x 逐个圆心 y 对账（漏判必须为 0）。
+    if (G.y - BIRD_R < p.top || G.y + BIRD_R > p.top + GAP) return die('撞上管子');
   }
+  assertNoVisualOverlap();
 }
 function die(cause) { if (!G.dead) { G.dead = true; G.cause = cause; G.deadT = 0; } }
+
+/** 运行时自检：按**当前状态**重算管子矩形，做一次圆-矩形重叠判断，
+ *  检查「画面上已经重叠、但还没判死」的情形，记进 `DBG.passThrough`。
+ *
+ *  为什么需要：离线校验器能证明几何公式一致，但证明不了**运行时**用的是不是
+ *  同一组数。用户反复报「碰到管子不死」，这里把「有没有漏判」变成可观测的事实。
+ *
+ *  ⚠️ 必须按当前状态重算，不能用渲染时记下的矩形 —— 那是上一帧的，而管子每 tick
+ *     移动约 4.8px，会因为「管子已经移走」报假穿透（实测踩过）。
+ *     守卫也要与 physics() 的提前 return 一致，否则会在没做判定的 tick 上比对。 */
+function assertNoVisualOverlap() {
+  if (G.dead || (G.warmupT || 0) < WARMUP_S) return;
+  DBG.checked = (DBG.checked || 0) + 1;
+  for (const p of G.pipes) {
+    const rects = [[p.x, 0, PIPE_W, p.top + BIRD_R + 1],
+                   [p.x, p.top + GAP - BIRD_R - 1, PIPE_W, G.H]];
+    for (const [rx, ry, rw, rh] of rects) {
+      const cx = Math.max(rx, Math.min(G.birdX, rx + rw));
+      const cy = Math.max(ry, Math.min(G.y, ry + rh));
+      const d2 = (G.birdX - cx) ** 2 + (G.y - cy) ** 2;
+      // 严格小于：相切（d == R）不算穿透，与 physics() 的严格不等式同语义
+      if (d2 < BIRD_R ** 2 - 1e-9) {
+        DBG.passThrough = (DBG.passThrough || 0) + 1;
+        DBG.passThroughLast = { y: Math.round(G.y), cx: Math.round(cx),
+          cy: Math.round(cy), rect: [rx, ry, rw, rh],
+          dist: Math.round(Math.sqrt(d2) * 100) / 100, R: BIRD_R };
+        return;
+      }
+    }
+  }
+}
 
 // ============================================================ 经典 FlappyBird 画面
 const GROUND = 92;                       // 地面高度（像素）
@@ -432,7 +472,7 @@ function drawGame() {
     // 下管从 top+GAP-R 起画。"最后一个被挡住的像素"比坐标大 1。
     // demo/verify_pipe_visual.js 覆盖全 x 范围逐像素守着这一点。
     drawPipe(g, p.x, 0, p.top + BIRD_R + 1);              // 上管
-    drawPipe(g, p.x, p.top + GAP - BIRD_R, G.H);          // 下管
+    drawPipe(g, p.x, p.top + GAP - BIRD_R - 1, G.H);      // 下管（像素带闭区间，再收 1px）
   }
   drawGround(g);
   drawBirdSprite(g);
