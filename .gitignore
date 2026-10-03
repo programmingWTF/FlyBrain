@@ -1,0 +1,39 @@
+# ---- 连接组数据 / 训练产物（都很大，可用脚本重新生成）----
+/data/*
+!/data/.gitkeep
+/runs/
+/checkpoints/
+/output/
+/logs/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+*.log
+
+# ---- 临时侦察 / 探针产物 ----
+/_recon/
+*_probe.mjs
+*.tmp
+
+# ---- Secrets（token 绝不能进仓库）----
+cave-secret.json
+chunkedgraph-secret.json
+*.secret.json
+
+# ---- Agent 工作笔记（本地过程记录，不入库）----
+# ⚠️ 注意区分：CLAUDE.md / AGENT.md 这类【Agent 指令文件】是项目的一部分，要入库，
+#    所以**故意不 ignore**。下面 ignore 的是 Agent 的私有记忆 / 会话过程笔记。
+.workbuddy/
+/.agent-teams/
+/.claude/
+/.cursor/
+history.jsonl
+
+# ---- Misc ----
+.DS_Store
+wandb/
+.idea/
+.vscode/
