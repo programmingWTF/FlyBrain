@@ -22,9 +22,8 @@
     <canvas id="game" width="520" height="620"></canvas>
     <canvas id="scope" width="520" height="118"></canvas>
     <div id="hud">
-      <div class="k">逼近角 θ</div><div class="v" id="h-theta">–</div>
-      <div class="k">角扩张速度</div><div class="v" id="h-dtheta">–</div>
-      <div class="k">剩余碰撞 τ</div><div class="v" id="h-tau">–</div>
+      <div class="k">反射方向</div><div class="v" id="h-theta">–</div>
+      <div class="k">驱动 / 阈值</div><div class="v" id="h-dtheta">–</div>
       <div class="k">LC4 发放率</div><div class="v" id="h-lc4">–</div>
       <div class="k">DNp01 近100ms</div><div class="v" id="h-dn">–</div>
       <div class="k">得分 / 最高</div><div class="v" id="h-score">0 / 0</div>
@@ -32,11 +31,10 @@
     <div id="flash"></div>
     <div id="note">
       <b>这不是训练出来的。</b>脑完全冻结（真实 FlyWire 接线，零可学参数）。
-      <b>反射镜</b>模式：迎面扩张的暗盘喂给视觉神经元 LC4，群体发放率跨过阈值时
-      逃逸指令神经元 <b>DNp01（即 giant fiber）</b>发放 → 闪避。<br>
-      <b>Flappy</b> 模式里苍蝇评估的是<b>最近的那个碰撞</b>（地面 / 天花板 / 前方管子，
-      取时间到接触最小的）。这一点很关键：只盯管子的话，它下落时没有任何东西逼它拍翅；
-      而<b>地面逼近本身就是货真价实的 looming</b>。加上之后同一颗冻结脑真的能飞起来。
+      苍蝇的两个半视野各自喂给视觉逼近神经元 <b>LC4 + LPLC2</b>：缺口在头顶时
+      <b>腹侧</b>半群被驱动，缺口在脚下时<b>背侧</b>半群被驱动；哪一面在逼近由
+      <b>接近速度门控</b>决定。驱动累积到阈值，逃逸指令神经元
+      <b>DNp01（即 giant fiber）</b>发放 → 拍翅。<br>
       按<b>空格</b>你可以亲自接管拍翅，体感一下这游戏有多难。
       再点<b>「切断 LC4→DNp01 那 102 条边」</b>—— 苍蝇当场瘫掉，而脑子其他部分照常活动。
     </div>
@@ -52,12 +50,10 @@
     </div>
     <div id="ctl">
       <div class="grp">
-        <div class="gt">模式</div>
+        <div class="gt">Flappy（唯一的模式）</div>
         <div class="radios">
-          <label><input type="radio" name="mode" value="reflex">反射镜 · 逼近盘 → 逃（一定看得见）</label>
-          <label><input type="radio" name="mode" value="retino">真实视野 · 威胁只覆盖它该覆盖的那片</label>
-          <label><input type="radio" name="mode" value="fly3d">第一人称走廊 · 整面带洞的墙迎面压来</label>
-          <label><input type="radio" name="mode" value="flappy" checked>Flappy · 用反射飞管子（会评估地面/天花板/管子哪个最先到）</label>
+          <label>用双向逼近反射飞管子：腹侧半视野（LC4+LPLC2）驱动爬升、
+            背侧驱动下潜，接近速度门控决定"哪一面在逼近"。</label>
         </div>
       </div>
       <div class="grp">
@@ -71,14 +67,8 @@
       </div>
       <div class="grp">
         <div class="gt">感觉参数（调这些，不是训练）</div>
-        <label>LC4 灵敏度 s50（度/秒）<output id="o-s50">15</output>
-          <input type="range" id="s50" min="5" max="120" step="1" value="15"></label>
-        <label>威胁半径 R（米）<output id="o-rad">0.05</output>
-          <input type="range" id="rad" min="0.01" max="0.20" step="0.005" value="0.05"></label>
         <label>管速 / 逼近速度（米/秒）<output id="o-spd">1.0</output>
           <input type="range" id="spd" min="0.2" max="4" step="0.1" value="1.0"></label>
-        <label>洞的尺寸 / 威胁角尺寸 θ（仅后两个模式）<output id="o-tmax">40</output>
-          <input type="range" id="tmax" min="5" max="170" step="5" value="40"></label>
         <label>触发所需脉冲数（100ms 内）<output id="o-need">1</output>
           <input type="range" id="need" min="1" max="4" step="1" value="1"></label>
       </div>

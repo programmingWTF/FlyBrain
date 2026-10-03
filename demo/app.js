@@ -23,8 +23,11 @@ const STRICT_TICKS = 5000;
 // ?batch=N：一次向脑请求 N 个 tick（用于量"批大小 vs 速率/分数"的取舍）
 const BATCH_Q = Number((location.search.match(/[?&]batch=(\d+)/) || [])[1] || 0);
 
-const P = { s50: 15, s50size: 30, rad: 0.05, spd: 1.0, need: 1, graph: 'real',
-            mode: 'flappy', tmax: 40, show3d: true };
+// 只留 Flappy 一个模式：`mode` 仍保留（少数读数按它取值），但**钉死不变**，
+// 界面上已无模式选择器 —— 其余模式的代码路径已整体删除。
+const MODE = 'flappy';
+const P = { s50size: 30, spd: 1.0, need: 1, graph: 'real',
+            mode: MODE, show3d: true };
 // ---------------------------------------------------------------- 双向逼近反射
 // 页面上的 Flappy 用的是"双向逼近反射 + 按执行器带宽生成关卡"这一档
 // （ESCAPE.md §6/§7）。它比原来那套"最近碰撞 + LC4 角速度"高一个数量级：
@@ -89,7 +92,7 @@ const SPRITE_SCALE = 0.715;
  *  vy_gate 在后端做（地面只在下落时逼近、天花板只在上升时逼近）。
  *  距离沿用同一套"等效半宽 0.55"的写法，与 scripts/flappy_bench.py 一致。
  */
-function bidiBody(th, ticks) {
+function bidiBody(ticks) {
   const gapC = nearestPipe() ? nearestPipe().top + GAP / 2 : G.H / 2;
   const up = gapC < G.y - FLAPPY.gapMargin;
   const hPx = Math.max(up ? (G.H - GROUND) - G.y : G.y, 1);
@@ -111,53 +114,6 @@ function bidiBody(th, ticks) {
                       vent_dev: FLAPPY.ventDev }] };
 }
 
-/** 当前威胁的几何：返回 {distM, speed, radius} 或 null。
- *  reflex 模式：一个正对苍蝇飞来的暗盘（这就是文献里的逼近刺激）。
- *  flappy  模式：见 bidiBody()（双向反射不看"最近碰撞"，看缺口在视野的哪一半）。 */
-function threat() {
-  if (P.mode === 'fly3d') return geom3d();
-  if (P.mode !== 'flappy') {
-    if (G.threatD == null) return null;
-    return { distM: Math.max(G.threatD, 0.02), speed: P.spd, radius: P.rad };
-  }
-  const vpx = P.spd * PX_PER_M;
-  const cands = [];
-  const near = nearestPipe();
-  if (near) cands.push({ dpx: near.x + PIPE_W - G.birdX, vpx: vpx, rad: P.rad });
-  const groundY0 = G.H - GROUND;
-  if (G.vy > 0) cands.push({ dpx: groundY0 - G.y, vpx: G.vy, rad: 0.55 });
-  if (G.vy < 0) cands.push({ dpx: G.y, vpx: -G.vy, rad: 0.55 });
-  let best = null;
-  for (const c of cands) {
-    const ttc = c.dpx / Math.max(c.vpx, 1e-6);
-    if (c.dpx > 0 && (!best || ttc < best.ttc)) best = { ...c, ttc };
-  }
-  if (!best) return null;
-  return { distM: Math.max(best.dpx / PX_PER_M, 0.02),
-           speed: Math.max(best.vpx / PX_PER_M, 0.02), radius: best.rad };
-}
-
-function disp() {
-  const r = S.resp; if (!r) return null;
-  return Object.assign({}, G.geo || {}, r);
-}
-
-function coverage(width) {
-  // mean_{u in [0,1]} exp(-((u-0.5)/(width/2.355))^2/2)，数值积分
-  let sum = 0;
-  for (let i = 0; i < 101; i++) {
-    const u = i / 100;
-    sum += Math.exp(-Math.pow((u - 0.5) / Math.max(width / 2.355, 1e-6), 2) / 2);
-  }
-  return sum / 101;
-}
-
-const HOLD_S = 0.7;      // 逼近到最近点后**保持**多久
-function newThreat() {
-  G.threatD = 2.2;                       // 从 2.2 米外开始逼近
-  G.hold = 0;
-  G.dodged = false;
-}
 
 function resetGame() {
   G.started = false; G.readyT = performance.now();
@@ -168,9 +124,7 @@ function resetGame() {
   // 每一局都要归零。之前一次改动把这行弄丢了，导致撞死后分数跨局累加、
   // "最高"也跟着变成累计值 —— 看起来就是得分算错。
   G.score = 0;
-  if (P.mode !== 'flappy') {
-    G.y = 310; newThreat();
-  } else {
+  {
     // 开局就得有管子、而且不能太远：第一版栽在两个自锁上 ——
     //  (a) 没管子 -> 没刺激 -> 反射不触发 -> 摔死 -> 重置 -> 还是没管子；
     //  (b) 管子从 1.4 米外开始，而鸟 0.72 秒落地，反射来不及救它。
@@ -222,66 +176,22 @@ async function post(path, body) {
 
 let inFlight = false;
 function stepBrain(ticks) {
-  DBG.sbCalls = (DBG.sbCalls || 0) + 1;      // 排障：被调用次数
-  if (inFlight) { DBG.sbBusy = (DBG.sbBusy || 0) + 1; return false; }
-  // Flappy 走双向反射（方向由缺口在视野里的高低决定），不需要"最近碰撞"那套几何。
-  const th = (P.mode === 'flappy') ? { bidi: true } : threat();
-  if (!th) { DBG.sbNoThreat = (DBG.sbNoThreat || 0) + 1; return false; }
+  if (inFlight) return false;
+  // 只有 Flappy：双向逼近反射（方向由缺口在视野里的高低决定），
+  // 不再需要"最近碰撞"那套几何。
   inFlight = true;
-  // 几何量是前端算的（后端只收"每个群发多少"），所以显示要自己留一份
-  if (!th.bidi) {
-    G.geo = {
-      theta_deg: 180 / Math.PI * 2 * Math.atan(th.radius / Math.max(th.distM, 1e-3)),
-      dtheta_dps: 180 / Math.PI * (2 * th.radius * th.speed /
-                                   (th.distM ** 2 + th.radius ** 2)),
-      tau_s: th.distM / Math.max(th.speed, 1e-6),
-    };
-  }
   let body;
-  if (P.mode === 'fly3d') {
-    // 整面墙都驱动，只有洞那块不驱动：把洞的视网膜方位/角半径换算成视野坐标
-    const g = threat();
-    if (!g) return false;
-    const c = Math.min(0.98, Math.max(0.02, 0.5 + g.elevDeg / FOV_DEG));
-    const width = Math.max(0.03, 2 * g.thetaDeg / FOV_DEG);
-    const ampV = Math.min(1, Math.max(0, Math.pow(g.dtheta_dps, 3) /
-                   (Math.pow(g.dtheta_dps, 3) + Math.pow(P.s50, 3))));
-    const ampS = Math.min(1, Math.max(0, Math.pow(g.thetaDeg * 2, 3) /
-                   (Math.pow(g.thetaDeg * 2, 3) + Math.pow(P.s50size, 3))));
-    G.cov = 1 - coverage(width);
-    body = { ticks, need_spikes: P.need,
-             drives: [{ group: 'LC4', amp: ampV, center: c, width, hole: 1 },
-                      { group: 'LPLC2', amp: ampS, center: c, width, hole: 1 }] };
-  } else if (P.mode === 'retino') {
-    // 威胁只覆盖它视野里该覆盖的那一块：按角尺寸换算成视野占比 width，
-    // 用高斯窗只驱动偏好位置与之重叠的那批 LC4。
-    // 一个威胁只落在视野的一小块上 -> 只有偏好位置重叠的那批细胞被驱动。
-    // 两条逼近通道一起给：LC4=角速度、LPLC2=角大小（GF 的真实输入结构）。
-    const width = Math.min(1.6, Math.max(0.05, P.tmax / 180));
-    G.cov = coverage(width);
-    body = { ticks, need_spikes: P.need,
-             drives: [{ group: 'LC4', amp: loomAmp(th), center: 0.5, width },
-                      { group: 'LPLC2', amp: sizeAmp(th), center: 0.5, width }] };
-  } else {
-    // Flappy：双向逼近反射（见 bidiBody 的说明）。物理常数与判据都没变，
-    // 只是把"驱动哪些细胞"从"最近碰撞"换成"缺口落在视野的哪一半"。
-    body = bidiBody(th, ticks);
-  }
+  // 双向逼近反射（见 bidiBody 的说明）。物理常数与判据都没变，
+  // "驱动哪些细胞"由缺口落在视野的哪一半决定。
+  body = bidiBody(ticks);
   post('/api/step', body).then(r => {
-    DBG.sbOk = (DBG.sbOk || 0) + 1;
     if (r.error) { $('stat').textContent = '后端错误：' + r.error; return; }
     S.resp = r;
     G.hist.push(r.drive ?? r.drive_max ?? 0);
     if (G.hist.length > 200) G.hist.shift();
     if (r.flap && G.cooldown <= 0 && !G.dead) {
       G.cooldown = FLAP_COOLDOWN; G.flashT = 0.12;
-      if (P.mode === 'fly3d') { F3.vz = FLAP3; G.flashT = 0.12; }
-      else if (P.mode !== 'flappy') {
-        if (!G.dodged) { G.dodged = true; G.score++; G.best = Math.max(G.best, G.score); }
-        G.dodgeT = 0.3;
-      } else {
-        G.vy = FLAP_V;
-      }
+      G.vy = FLAP_V;
     }
     if (r.dn01_recent > 0) G.dnFlash = 0.2;
   }).catch(e => {
@@ -292,23 +202,6 @@ function stepBrain(ticks) {
   return true;
 }
 
-function loomAmp(th) {
-  const d = Math.max(th.distM, 1e-3);
-  const dtheta = 180 / Math.PI * (2 * th.radius * th.speed / (d * d + th.radius ** 2));
-  const n = 3;
-  return Math.min(1, Math.max(0, Math.pow(dtheta, n) / (Math.pow(dtheta, n) + Math.pow(P.s50, n))));
-}
-
-/** 角大小通道（LPLC2）：文献里 LPLC2 编码的是角尺寸而不是扩张速度，
- *  且对平移不响应（Klapoetke 2017 / Ache 2019）。 */
-function sizeAmp(th) {
-  const d = Math.max(th.distM, 1e-3);
-  const theta = 180 / Math.PI * 2 * Math.atan(th.radius / d);
-  const n = 3;
-  return Math.min(1, Math.max(0, Math.pow(theta, n) /
-         (Math.pow(theta, n) + Math.pow(P.s50size, n))));
-}
-
 function nearestPipe() {
   let best = null;
   for (const p of G.pipes) if (p.x + PIPE_W > G.birdX - 6 && (!best || p.x < best.x)) best = p;
@@ -317,36 +210,9 @@ function nearestPipe() {
 
 // ---------------------------------------------------------------- 物理
 function physics(dt) {
-  if (P.mode === 'fly3d') {
-    G.cooldown = Math.max(0, G.cooldown - dt);
-    G.flashT = Math.max(0, G.flashT - dt);
-    physics3d(dt);
-    return;
-  }
   G.cooldown = Math.max(0, G.cooldown - dt);
   G.flashT = Math.max(0, G.flashT - dt);
-  G.dodgeT = Math.max(0, G.dodgeT - dt);
   G.dnFlash = Math.max(0, G.dnFlash - dt);
-
-  if (P.mode !== 'flappy') {
-    // 悬停 + 逼近盘；反射触发就往上闪避。没有重力，所以这个模式一定看得见效果。
-    // 经典逼近范式：扩张到最近点后**保持一段时间**再撤。
-    // 不保持的话，最高驱动区只持续 2~3 个 tick（40~60ms），
-    // 而脑的泄漏积分需要 ~8 个 tick 才越过阈值 —— 那是时钟分辨率问题，
-    // 不是"脑不躲"。
-    if (G.threatD != null && G.threatD > 0.05) G.threatD -= P.spd * dt;
-    else if (G.threatD != null) {
-      G.hold += dt;
-      if (G.hold > HOLD_S) {
-        if (!G.dodged) { G.miss++; G.cause = '没逃掉'; G.deadT = 0.5; }
-        newThreat();
-      }
-    }
-    const bob = Math.sin(performance.now() / 260) * 5;
-    const dodge = G.dodgeT > 0 ? Math.sin((0.3 - G.dodgeT) / 0.3 * Math.PI) * 95 : 0;
-    G.y = 310 + bob - dodge;
-    return;
-  }
 
   if (G.dead) { G.deadT += dt; if (G.deadT > 1.6) resetGame(); return; }
   if (!G.started) {                      // 前 1.2 秒悬空展示，然后交给反射
@@ -536,34 +402,25 @@ function drawGame() {
   g.strokeStyle = 'rgba(120,140,170,.25)';
   for (let x = 0; x < G.W; x += 40) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, G.H); g.stroke(); }
 
-  if (P.mode === 'fly3d') { drawCorridor(g); drawDeath(g); return; }
-  if (P.mode === 'flappy') {
-    drawSky(g);
-    for (const p of G.pipes) {
-      // 管口朝着缺口（标准 FlappyBird 的形状）。
-      //
-      // ⚠️ 边界要内缩一个**鸟半径**：physics() 判的是鸟**中心点**
-      //    （`G.y - 11 < top || G.y + 11 > top + GAP`），所以对中心点而言
-      //    管子真正挡住的是 `y < top+11` 那一段。如果管子只画到 top，
-      //    就等于"看着碰到了（鸟身压着管口）却不算撞" —— 这正是之前那个
-      //    "碰到管子不判定失败"的根源。画到"鸟身体真正会碰到的位置"才对得上。
-      // 注意边界是**坐标**，而"最后一个不该画的像素"是坐标-1：
-      //   y+11 > top+GAP 不成立的最大整数 y 是 top+GAP-11，所以下管从 top+GAP-11 起画。
-      // 差 1 像素就会在缺口里多出一条"看着撞了却不算"的线，所以这里对齐到像素。
-      const R = 11;                                  // = physics() 里的鸟半径
-      drawPipeSprite(g, p.x, p.top + R, 0, R);                    // 上管
-      drawPipeSprite(g, p.x, p.top + GAP - R + 1, G.H, R);        // 下管
-    }
-    drawGround(g);
-    drawBirdSprite(g);
-    drawScoreBig(g);
-    if (!G.started) drawReady(g);
-  } else if (P.mode !== 'retino') {
-    drawThreat(g); drawBirdSprite(g);
-  } else {
-    drawThreat(g); drawBirdSprite(g);
+  // 只有 Flappy 一个模式（mode 已钉死），所以这里不再按模式分支。
+  drawSky(g);
+  for (const p of G.pipes) {
+    // 管口朝着缺口（标准 FlappyBird 的形状）。
+    //
+    // ⚠️ 边界要内缩一个**鸟半径**：physics() 判的是鸟**中心点**，所以对中心点而言
+    //    管子真正挡住的是 `y < top+R` / `y > top+GAP-R` 那两段。如果管子只画到 top，
+    //    就等于"看着碰到了（鸟身压着管口）却不算撞"。
+    // 注意边界是**坐标**，而"最后一个不该画的像素"是坐标-1：
+    //    y+R > top+GAP 不成立的最大整数 y 是 top+GAP-R，所以下管从 top+GAP-R+1 起画。
+    // 差 1 像素就会在缺口里多出一条"看着撞了却不算"的线，所以这里对齐到像素。
+    // demo/verify_pipe_visual.js 逐像素守着这一点。
+    drawPipeSprite(g, p.x, p.top + BIRD_R, 0, BIRD_R);                      // 上管
+    drawPipeSprite(g, p.x, p.top + GAP - BIRD_R + 1, G.H, BIRD_R);          // 下管
   }
-
+  drawGround(g);
+  drawBirdSprite(g);
+  drawScoreBig(g);
+  if (!G.started) drawReady(g);
 
   if (G.flashT > 0) { $('flash').className = 'on'; $('flash').innerHTML = '<span>跳!</span>'; }
   else $('flash').className = '';
@@ -572,44 +429,32 @@ function drawGame() {
 
 function drawDeath(g) {
   if (!G.dead) return;
-  if (P.mode === 'flappy') { g.fillStyle = 'rgba(0,0,0,.35)';
-    g.fillRect(0, 0, G.W, G.H); drawOverCard(g); return; }
-  g.fillStyle = 'rgba(0,0,0,.55)'; g.fillRect(0, 0, G.W, G.H);
-  g.fillStyle = '#fff'; g.font = 'bold 26px system-ui'; g.textAlign = 'center';
-  g.fillText(G.cause, G.W / 2, G.H / 2 - 8);
-  g.font = '13px system-ui'; g.fillStyle = '#9aa7b8';
-  g.fillText('本局 ' + G.score + ' 分 · 反射在下一局继续', G.W / 2, G.H / 2 + 18);
-  g.textAlign = 'left';
+  g.fillStyle = 'rgba(0,0,0,.35)'; g.fillRect(0, 0, G.W, G.H); drawOverCard(g);
 }
 
-/** 反射镜模式：一个正对苍蝇扩张的暗盘 —— 文献里的 looming 刺激本体 */
-function drawThreat(g) {
-  const r = disp(); if (!r) return;
-  const rad = Math.min(G.W, (r.theta_deg / 160) * G.W);
-  g.fillStyle = '#000';
-  g.beginPath(); g.arc(G.birdX + 150, 310, Math.max(6, rad), 0, 7); g.fill();
-  g.strokeStyle = 'rgba(255,140,26,.5)'; g.setLineDash([5, 4]);
-  g.beginPath(); g.arc(G.birdX + 150, 310, Math.max(6, rad), 0, 7); g.stroke();
-  g.setLineDash([]);
-  g.fillStyle = '#9aa7b8'; g.font = '12px system-ui';
-  g.fillText('θ = ' + r.theta_deg.toFixed(1) + '°   dθ/dt = ' + r.dtheta_dps.toFixed(0)
-             + ' °/s   τ = ' + r.tau_s.toFixed(2) + ' s', 16, 24);
-  g.fillStyle = G.miss ? '#ff6b6b' : '#455263';
-  g.fillText('逃掉 ' + G.score + ' 次 · 没逃掉 ' + G.miss + ' 次', 16, 44);
-}
-
-/** 苍蝇视角：把最近的管子画成正在扩张的暗盘 */
+/** 反射状态圆盘：显示当前驱动的是哪一半视野、以及 Σw·p / 阈值。
+ *  （原来这里是"把管子画成扩张暗盘"的视网膜视图，那套几何只对已删除的模式有意义。） */
 function drawFlyView(g, ox, oy, R) {
-  const r = disp(); if (!r) return;
   const cx = ox, cy = oy;
+  const br = (G.geo && G.geo.branch) || '-';
+  const ratio = Math.min(1.2, (S.resp?.eff ?? 0) / Math.max(S.resp?.need ?? 0.0604, 1e-9));
   g.save(); g.beginPath(); g.arc(cx, cy, R, 0, 7); g.clip();
-  g.fillStyle = '#7fd0d8'; g.fillRect(cx - R, cy - R, R * 2, R * 2);
-  const rr = Math.max(3, Math.min(R * 1.9, (r.theta_deg / 160) * R * 1.9));
-  g.fillStyle = '#000'; g.beginPath(); g.arc(cx, cy, rr, 0, 7); g.fill();
+  g.fillStyle = '#0d1420'; g.fillRect(cx - R, cy - R, R * 2, R * 2);
+  // 上半 = 腹侧（爬升），下半 = 背侧（下潜）
+  const vent = br === 'ventral', dors = br === 'dorsal';
+  g.fillStyle = vent ? '#3ad07a' : '#26313f';
+  g.fillRect(cx - R, cy - R, R * 2, R);
+  g.fillStyle = dors ? '#ff8c1a' : '#26313f';
+  g.fillRect(cx - R, cy, R * 2, R);
+  // 驱动条：越接近阈值越满
+  g.fillStyle = ratio >= 1 ? '#ff2d55' : '#39d0ff';
+  g.fillRect(cx - R, cy + R - Math.min(1, ratio) * R * 0.4, R * 2, Math.min(1, ratio) * R * 0.4);
   g.restore();
   g.strokeStyle = 'rgba(120,140,170,.55)'; g.beginPath(); g.arc(cx, cy, R, 0, 7); g.stroke();
   g.fillStyle = '#8d9aab'; g.font = '10px system-ui'; g.textAlign = 'center';
-  g.fillText('苍蝇看到 θ=' + r.theta_deg.toFixed(0) + '°', cx, cy + R + 11);
+  g.fillText(br === 'ventral' ? '腹侧→爬升' : br === 'dorsal' ? '背侧→下潜' : '已对准',
+             cx, cy + R + 11);
+  g.fillText('Σw·p/阈值 = ' + ratio.toFixed(2), cx, cy - R - 4);
   g.textAlign = 'left';
 }
 
@@ -638,128 +483,14 @@ function drawDrive(g, x0 = 14, y0 = G.H - 118, w = G.W - 28, h = 96) {
   });
   g.stroke(); g.lineWidth = 1;
   g.fillStyle = '#ff8c1a'; g.fillText('LC4 群发放率（驱动）', x0 + 6, y0 + 12);
-  // 驱动从没越过红线 = 反射根本没机会触发，这几乎一定是感觉参数不对，
-  // 不是"脑子不行"。直接把可调的旋钮告诉用户。
-  if (P.mode === 'retino') {
-    // 仪表显示的是**连接组算出来的有效突触驱动** Σw·p 对阈值 (1-leak)·thr/gain 的比值。
-    // 这比"细胞个数占比"诚实：决定逃逸的是被驱动的那批细胞里有多少强突触。
-    const cov = Math.min(1.2, (S.resp?.eff ?? 0) / Math.max(S.resp?.need ?? 0.0604, 1e-9));
-    const needTxt = '需 Σw·p ≥ ' + ((S.resp?.need ?? 0.0604)).toFixed(3);
-    const bw = 26, bx = x0 + w - bw - 10, by = y0 + 10, bh = h - 20;
-    g.fillStyle = '#0d1420'; g.fillRect(bx, by, bw, bh);
-    g.fillStyle = cov >= 1 ? '#3ddc84' : '#ff6b6b';
-    g.fillRect(bx, by + bh * (1 - Math.min(1, cov)), bw, bh * Math.min(1, cov));
-    const yl = by + bh * (1 - 1);
-    g.strokeStyle = '#ffd400'; g.setLineDash([3, 3]);
-    g.beginPath(); g.moveTo(bx - 4, yl); g.lineTo(bx + bw + 4, yl); g.stroke();
-    g.setLineDash([]);
-    g.fillStyle = '#ffd400'; g.font = '10px system-ui';
-    g.fillText('阈值线', bx - 4, yl - 4);
-    g.fillText(needTxt, x0 + 6, y0 + h + 24);
-    g.fillStyle = '#cfd8e3';
-    g.fillText('驱动/阈值', bx - 16, by + bh + 12);
-    g.fillText((cov * 100).toFixed(0) + '%', bx + 4, by + bh + 24);
-  }
+  // 驱动从未越过红线 = 反射没机会触发。现在只有 Flappy 一个模式，
+  // 可调的旋钮就剩"管速"和"触发脉冲数"。
   if (!G.hist.length || Math.max(...G.hist) < R50) {
     g.fillStyle = '#ffb300'; g.font = '11px system-ui';
-    g.fillText('驱动从未越过阈值 → 反射没机会触发：把 s50 调小 / 管速或威胁半径 R 调大',
+    g.fillText('驱动从未越过阈值 → 反射没机会触发：把管速调快或触发脉冲数调小',
                x0 + 6, y0 + h - 8);
     g.font = '10.5px system-ui';
   }
-}
-
-// ================================================================ 第一人称走廊
-// 摄像机就是苍蝇的眼睛：往前飞，一整面带洞的墙迎面压过来。
-// 侧视角的管子只占视野一小条（§3.8 证明那达不到逃逸阈值）；墙才是
-// 覆盖大部分视野的逼近物。这里把"墙"按视网膜坐标换算成驱动图样。
-const FOV_DEG = 180;            // 前半视野跨 180°，映射到视野坐标 u∈[0,1]
-const F_PX = 300;               // 透视焦距（像素/弧度）
-const GRAV3 = 3.0;              // 米/秒²
-const FLAP3 = 2.2;              // 一次拍翅给的垂直速度
-
-const F3 = { alt: 0.0, vz: 0.0, walls: [], spawnD: 6.0, nextHole: 0.0 };
-
-function reset3d() {
-  F3.alt = 0.0; F3.vz = 0.0; F3.walls = []; F3.spawnD = 5.0;
-  G.score = 0; G.miss = 0; G.dead = false; G.deadT = 0;
-}
-
-function spawnWall() {
-  const hr = Math.max(0.12, P.tmax / 400);            // 洞半径（米）
-  F3.walls.push({ d: F3.spawnD, hole: (Math.random() * 2 - 1) * 0.9, r: hr,
-                  passed: false });
-}
-
-/** 最近那面墙的视网膜几何：洞的方位、角半径、边界扩张速率 */
-function geom3d() {
-  const w = F3.walls.find(x => x.d > 0.02);
-  if (!w) return null;
-  const dy = w.hole - F3.alt;
-  const elev = Math.atan2(dy, w.d) * 180 / Math.PI;      // 洞在视野里的高低角
-  const theta = Math.atan(w.r / w.d) * 180 / Math.PI;    // 洞的角半径
-  // 逼近一面墙时，LC4 收到的不是"洞边界扩张"（远看几乎为 0），而是
-  // **视网膜上任意纹理点的移动速度**：偏心 45° 处 = v/d 弧度/秒。
-  // 单位仍是 °/s，所以能直接复用同一个 s50，不用另加自由参数。
-  const flow_dps = 180 / Math.PI * (P.spd / Math.max(w.d, 1e-3));
-  return { wall: w, distM: w.d, speed: P.spd, radius: w.r,
-           elevDeg: elev, thetaDeg: theta, dtheta_dps: flow_dps };
-}
-
-function physics3d(dt) {
-  if (G.dead) { G.deadT += dt; if (G.deadT > 1.2) reset3d(); return; }
-  F3.vz -= GRAV3 * dt;
-  F3.alt += F3.vz * dt;
-  if (F3.alt < -2.2) { F3.alt = -2.2; F3.vz = 0; }
-  if (F3.alt > 2.2) { F3.alt = 2.2; F3.vz = 0; }
-  for (const w of F3.walls) {
-    w.d -= P.spd * dt;
-    if (w.d <= 0.02 && !w.passed) {
-      w.passed = true;
-      if (Math.abs(w.hole - F3.alt) < w.r) { G.score++; G.best = Math.max(G.best, G.score); }
-      else { die('撞墙'); }
-    }
-  }
-  F3.walls = F3.walls.filter(w => w.d > -0.5);
-  const last = F3.walls[F3.walls.length - 1];
-  if (!last || last.d < F3.spawnD - 3.2) spawnWall();
-}
-
-function drawCorridor(g) {
-  const cx = G.W / 2, cy = G.H / 2;
-  // 地面/天花板的汇聚线：给出"正在往前飞"的深度感
-  const vp = cy - F3.alt * F_PX * 0.35;
-  g.fillStyle = '#04070e'; g.fillRect(0, 0, G.W, G.H);
-  g.strokeStyle = 'rgba(90,130,180,.28)'; g.lineWidth = 1;
-  for (let i = -4; i <= 4; i++) {
-    const y = vp + i * 150;
-    g.beginPath(); g.moveTo(cx, vp); g.lineTo(cx + i * 260, G.H > y ? G.H : -G.H); g.stroke();
-  }
-  for (let k = 1; k <= 6; k++) {                       // 深度环
-    const d = k * 1.6;
-    const rr = F_PX * 2.6 / d;
-    g.strokeStyle = `rgba(60,90,130,${0.30 - k * 0.04})`;
-    g.beginPath(); g.arc(cx, vp, rr, 0, 7); g.stroke();
-  }
-  // 墙：整面暗色 + 一个亮的洞
-  for (const w of [...F3.walls].sort((a, b) => a.d - b.d)) {
-    if (w.d <= 0.05) continue;
-    const rr = Math.max(6, F_PX * w.r / w.d);
-    const oy = vp - F_PX * (w.hole - F3.alt) / w.d;
-    const alpha = Math.min(0.92, 1.4 / w.d);
-    g.fillStyle = `rgba(2,4,8,${alpha})`; g.fillRect(0, 0, G.W, G.H);
-    g.save();
-    g.globalCompositeOperation = 'destination-out';
-    g.beginPath(); g.arc(cx, oy, rr, 0, 7); g.fill();
-    g.restore();
-    g.strokeStyle = w.d < 1.2 ? '#ff2d55' : '#39d0ff';
-    g.lineWidth = 2.5; g.beginPath(); g.arc(cx, oy, rr, 0, 7); g.stroke();
-    g.lineWidth = 1;
-  }
-  g.fillStyle = '#cfd8e3'; g.font = '12px system-ui';
-  g.fillText('苍蝇的第一人称视野 · 洞 = 可通过的亮区', 16, G.H - 14);
-  g.fillText('高度 ' + F3.alt.toFixed(2) + ' m   下一个洞 '
-             + ((F3.walls.find(x => x.d > 0.02) || {}).hole ?? 0).toFixed(2) + ' m',
-             16, 20);
 }
 
 // ---------------------------------------------------------------- 3D 脑
@@ -896,10 +627,15 @@ function setTxt(id, v) {                       // 值没变就不碰 DOM（避�
   _hudCache[id] = v; $(id).textContent = v;
 }
 function hud() {
-  const r = disp();
-  setTxt('h-theta', r ? r.theta_deg.toFixed(1) + '°' : '–');
-  setTxt('h-dtheta', r ? r.dtheta_dps.toFixed(0) + ' °/s' : '–');
-  setTxt('h-tau', r ? r.tau_s.toFixed(2) + ' s' : '–');
+  // 只报告 Flappy 真正用到的量：反射方向、驱动/阈值、发放率、脉冲数。
+  const r = S.resp;
+  const br = (G.geo && G.geo.branch) || (r && r.plan && r.plan.branch) || null;
+  const brTxt = br === 'ventral' ? '腹侧 → 爬升'
+              : br === 'dorsal'  ? '背侧 → 下潜'
+              : br === 'aligned' ? '已对准' : '–';
+  const ratio = r ? (r.eff ?? 0) / Math.max(r.need ?? 0.0604, 1e-9) : null;
+  setTxt('h-theta', brTxt);
+  setTxt('h-dtheta', ratio === null ? '–' : ratio.toFixed(2) + '×');
   setTxt('h-lc4', r ? (r.lc4_rate * 50).toFixed(1) + ' Hz' : '–');
   setTxt('h-dn', r ? r.dn01_recent + ' 个脉冲' : '–');
   const dn = $('h-dn'), c = r && r.dn01_recent > 0 ? '#ff2d55' : '';
@@ -916,20 +652,12 @@ function initUI() {
       $(out).textContent = fmt ? fmt(P[key]) : P[key];
     });
   };
-  bind('s50', 's50', 'o-s50'); bind('rad', 'rad', 'o-rad', v => v.toFixed(3));
   bind('spd', 'spd', 'o-spd', v => v.toFixed(1)); bind('need', 'need', 'o-need');
-  bind('tmax', 'tmax', 'o-tmax');
   const cb = $('cb3d');
   if (cb) cb.addEventListener('change', () => {
     P.show3d = cb.checked;
     $('brain').style.display = cb.checked ? 'block' : 'none';
     $('legend').style.display = cb.checked ? 'block' : 'none';
-  });
-  document.querySelectorAll('input[name=mode]').forEach(el => {
-    el.addEventListener('change', () => {
-      P.mode = el.value; G.score = 0; G.miss = 0;
-      if (el.value === 'fly3d') reset3d(); else resetGame();
-    });
   });
   document.querySelectorAll('input[name=graph]').forEach(el => {
     // 干预状态存在服务端，刷新页面不会回滚 —— 必须把单选框同步成实际值，
@@ -939,7 +667,7 @@ function initUI() {
       $('stat').textContent = '正在重建脑（' + el.value + '）…';
       const r = await post('/api/config', { graph: el.value });
       // 换干预 = 换被试：计分必须清零，否则看不出是干预造成的差别
-      G.score = 0; G.miss = 0; G.best = 0; resetGame();
+      G.score = 0; G.best = 0; resetGame();
       $('stat').textContent = r.error ? '失败：' + r.error
         : '干预 = ' + el.value + (el.value === 'real' ? '（正常反射）' : '（对照）');
     });
@@ -947,7 +675,7 @@ function initUI() {
   $('btn-reset').addEventListener('click', () => { post('/api/reset', {}); resetGame(); });
   // 手动拍翅：让人亲自试一下这个游戏有多难，体感比看数字直观
   const manual = () => {
-    if (P.mode !== 'flappy' || G.dead) return;
+    if (G.dead) return;
     G.started = true; delete G.readyT; G.vy = FLAP_V; G.manual = true;
   };
   addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); manual(); } });
