@@ -82,9 +82,11 @@ const BIRD_R = 11;
 //: 再乘 SPRITE_SCALE 就能完整装进判定体积。
 const SPRITE_ROT_MAX = 0.30;
 //: 精灵整体缩放。**由 verify_bird_volume.js 量出来的**：原始外接半径上界
-//: 15.06px（翅膀展开那一相位撑出来的）÷ BIRD_R(11) → 应 ≤ 0.730，取 0.715 留余量。
-//: 缩放后外接约 10.8px ≤ 11px。改了精灵形状或旋转上限就让校验器重算这个数。
-const SPRITE_SCALE = 0.715;
+//: 12.13px ÷ BIRD_R(11) → 应 ≤ 0.907，取 0.90。
+//: 关键是精灵比例要接近正方 —— 第一版是 15.06×10.10（1.5:1，长喙撑的），
+//: 被水平方向卡住只能取 0.715，鸟看起来偏小、竖直还浪费 3.8px。
+//: 现在 12.13×11.00，缩放 0.90，鸟画出来约 22×20px（正常游戏大小）。
+const SPRITE_SCALE = 0.90;
 
 /** 双向逼近反射的"望远镜几何"：只算纯几何量，交给后端决定驱动哪些细胞。
  *
@@ -332,30 +334,30 @@ function birdRot(vy) {
 
 /** 画鸟。**所有形状都落在半径 BIRD_R 的圆内** —— 这是"看着碰到就一定判定到"的前提。
  *
- *  原实现（椭圆 17×13 + 随速度旋转 ±0.55/1.10 + 翅膀/眼睛/喙 到 x=25）实测外接
- *  竖直 23.2px、水平 25.0px，而判定半径只有 11px：下落时精灵压进管子 12px 都还算
- *  "没碰到"。用户报的"看着碰到了却不失败"就是这个。
- *
- *  改法不是把整只鸟缩小（那样要 0.44 倍，小得没法看），而是重新排布：
- *  局部坐标下所有形状的 |x|、|y| 都 ≤ 13，SPRITE_ROT_MAX 下旋转后的外接半径
- *  ≤ 13.7，乘 SPRITE_SCALE(0.802) 后 ≤ 11 —— 与判定体积一致。
- *  翼展和喙都保留，只是不再探出判定范围。
- *  `demo/verify_bird_volume.js` 把这些形状变换到世界坐标后逐条核对。 */
+ *  设计要点（踩过一轮才理清）：
+ *  判定体积是**圆**（`|y_center − y_pipe| < BIRD_R`），所以精灵也必须**填满这个圆**，
+ *  否则视觉上就比实际判定小一号（第一版是 15.06 宽 × 10.10 高，比例 1.5:1，
+ *  竖直方向浪费了 3.8px，鸟看起来偏小）。
+ *  现在身体用橄榄形（1.14:1）、喙只探 1.6px，原始外接接近正方，
+ *  SPRITE_SCALE 就能接近 1，鸟画出来就是**正常游戏里的大小**。
+ *  demo/verify_bird_volume.js 会把这些形状变换到世界坐标后逐条核对，
+ *  并直接给出 SPRITE_SCALE 该取多少。 */
 function drawBirdSprite(g) {
   g.save(); g.translate(G.birdX, G.y); g.rotate(birdRot(G.vy)); g.scale(SPRITE_SCALE, SPRITE_SCALE);
   g.fillStyle = '#f7d51d'; g.strokeStyle = '#5c4708'; g.lineWidth = 2;
-  g.beginPath(); g.ellipse(0, 0, 13, 10, 0, 0, 7); g.fill(); g.stroke();
-  g.fillStyle = '#fdf3c0'; g.beginPath(); g.ellipse(-1.5, 3, 8, 4.5, 0, 0, 7); g.fill();
-  // 翅膀：三相位扇动（扇动半径也让它在判定圆内）
+  g.beginPath(); g.ellipse(0, 0, 12, 11, 0, 0, 7); g.fill(); g.stroke();
+  g.fillStyle = '#fdf3c0'; g.beginPath(); g.ellipse(-1.5, 3, 7, 4.5, 0, 0, 7); g.fill();
+  // 翅膀：三相位扇动（扇动半径也留在判定圆内）
   const ph = [0.55, 0.1, -0.45][G.wingPhase];
-  g.save(); g.translate(-3, -1); g.rotate(ph);
+  g.save(); g.translate(-2, -1); g.rotate(ph);
   g.fillStyle = '#f0a81c'; g.strokeStyle = '#5c4708';
-  g.beginPath(); g.ellipse(-5, 0, 7, 4.5, 0, 0, 7); g.fill(); g.stroke(); g.restore();
+  g.beginPath(); g.ellipse(-4, 0, 6, 4, 0, 0, 7); g.fill(); g.stroke(); g.restore();
   g.fillStyle = '#fff'; g.beginPath(); g.arc(6, -3, 4, 0, 7); g.fill();
   g.fillStyle = '#222'; g.beginPath(); g.arc(7, -3, 1.8, 0, 7); g.fill();
-  // 喙：尖端在 x=12.5（乘 0.802 后 ≈ 10.0 < BIRD_R），不再探出判定范围
+  // 喙：只探出 1.6px —— 第一版探到 25，把水平外接撑成 1.5 倍宽，
+  // 于是"要塞进圆"就不得不把整只鸟缩到 0.715，鸟就小了。
   g.fillStyle = '#f07f18'; g.strokeStyle = '#a4530b'; g.lineWidth = 1.5;
-  g.beginPath(); g.moveTo(9, -1.5); g.lineTo(12.5, 0.5); g.lineTo(9, 3); g.closePath();
+  g.beginPath(); g.moveTo(8.5, -1.5); g.lineTo(11, 1); g.lineTo(8.5, 3.5); g.closePath();
   g.fill(); g.stroke();
   g.restore();
 }
