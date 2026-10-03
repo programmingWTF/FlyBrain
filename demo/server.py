@@ -157,17 +157,31 @@ class Session:
             ok = np.abs(pts).sum(1) > 1e-6
             if ok.sum() < 8:
                 continue
+            # ⚠️ 不能取"全体方差最大的轴"：那是 x 轴，而 x 完美区分左右半球
+            # （分侧 AUC=0/1），拿它当视野轴等于把"左脑/右脑"说成"视野上/下"。
+            # 正确做法：先认半球轴（方差最大那根）并剔除它，再在**同侧内部**
+            # 取方差最大的轴作为视野轴，u 在每个半球内部各自归一化。
+            hemi = int(np.argmax(pts[ok].std(0)))
+            sgn = np.sign(pts[:, hemi])
+            cand = [a for a in range(3) if a != hemi]
+            axis = max(cand, key=lambda a: np.mean([
+                pts[sgn == s, a].std() for s in (-1, 1) if (sgn == s).sum() > 3]))
+            u = np.zeros(len(ix), dtype=np.float32)
+            for s in (-1, 1):
+                m = sgn == s
+                if m.sum() < 2:
+                    continue
+                v = pts[m, axis]
+                u[m] = (v - v.min()) / max(v.max() - v.min(), 1e-9)
             spread = pts[ok].std(axis=0)
-            axis = int(np.argmax(spread))          # 视野轴（数据驱动）
+            self.retino_axis[nm] = {"hemi_axis": "xyz"[hemi], "field_axis": "xyz"[axis],
+                                    "std_within_side": [round(float(v), 3) for v in spread]}
             v = pts[:, axis]
             med = np.median(v[ok])
-            gs[f"{nm}_hi"] = torch.as_tensor(ix[v >= med], dtype=torch.long, device=dev)
-            gs[f"{nm}_lo"] = torch.as_tensor(ix[v < med], dtype=torch.long, device=dev)
-            self.retino_axis[nm] = {"axis": "xyz"[axis],
-                                    "spread": [round(float(v), 3) for v in spread]}
+            gs[f"{nm}_hi"] = torch.as_tensor(ix[u >= 0.5], dtype=torch.long, device=dev)
+            gs[f"{nm}_lo"] = torch.as_tensor(ix[u < 0.5], dtype=torch.long, device=dev)
             # 归一化到 0..1 的"视野位置"坐标：威胁落在哪个位置，就只驱动
             # 偏好位置与之重叠的那批 LC4（这才是真实视网膜会发生的事）
-            u = (v - v[ok].min()) / max(v[ok].max() - v[ok].min(), 1e-9)
             self.retino_u[nm] = torch.as_tensor(u, dtype=torch.float32, device=dev)
             self.retino_u_idx[nm] = self.g[nm]
         sd = looming.resolve_side(self.base, ["DNp01", "DNp02", "DNp04", "DNp11"])
