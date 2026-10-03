@@ -250,25 +250,31 @@ function physics(dt) {
     if (!p.passed && p.x + PIPE_W < G.birdX) { p.passed = true; G.score++; G.best = Math.max(G.best, G.score); }
   }
   G.pipes = G.pipes.filter(p => p.x > -PIPE_W - 10);
-  // ---- 碰撞：**圆 vs 轴对齐矩形**，与 D:/Code/DQN 的 `FlappySim._collides` 同一判据。
-  //      (bx-cx)² + (by-cy)² <= r²，其中 (cx,cy) 是矩形上离圆心最近的点，
-  //      管子就是两个矩形 [x, 0, PIPE_W, top] 和 [x, top+GAP, PIPE_W, ground]。
-  // 因为矩形竖直方向是连续的，最近点的 cy 恒等于 by，所以竖直条件化简为下面两条。
+  // ---- 碰撞：鸟（圆）与管子（矩形）。
   //
-  // ⚠️ 必须是**严格**不等式 —— 这是「碰到管子要判死」的唯一修正。
-  // 画出来的管子是像素块：块从索引 h 起、高 len，覆盖的是**坐标** [h, h+len)。
-  //   上管覆盖像素 [0, p.top+R]        → 几何下沿在坐标 p.top+R+1
-  //   下管覆盖像素 [p.top+GAP-R-1, …]  → 几何上沿在坐标 p.top+GAP-R-1
-  // 鸟圆周下沿 y+R、上沿 y-R，所以"真的重叠"就是：
-  //   y + R > p.top + GAP   或   y - R < p.top
-  // 原来用 <= / >=，判定整体比画面**小 1px**：圆周已经压进管子、视觉明显重叠，
-  // 判定却不触发 —— 就是用户报的「碰到柱子不死」。
+  // ⚠️ 竖直判据是**像素级**推出来的，不要再"化简"，很容易差 1px。
+  //    `fillRect(y, h)` 覆盖像素 y … y+h-1（**闭区间**），而 drawGame 里
+  //      上管 = drawPipe(g, p.x, 0, p.top+R+1)        → 覆盖像素 [0, p.top+R]
+  //      下管 = drawPipe(g, p.x, p.top+GAP-R-1, G.H)  → 覆盖像素 [p.top+GAP-R-1, …]
+  //    鸟圆周覆盖像素 [ceil(y-R), floor(y+R)]，与管子像素行有交集即视觉重叠，
+  //    所以"画面上重叠 ⇔ 判定撞"要求：
+  //      上管：y - R <= p.top + R
+  //      下管：y + R >= p.top + GAP - R - 1
+  //    —— 就是下面这两条。这是让"只画不判 / 只判不画"同时为 0 的唯一一组。
+  //
+  //    之前写成 `y - R <= p.top || y + R >= p.top + GAP`（把 p.top 当像素用），
+  //    以及 `y - R < p.top || y + R > p.top + GAP`，两个方向各差了一段 R
+  //    （实测"只画不判"35~37 个 y），表现就是用户报的【撞上了却不判失败】。
+  //
+  // demo/verify_collision_pixels.js 用**逐像素**对账守着（不做几何换算）：
+  // 5 个 top 值下"只画不判"与"只判不画"都必须为 0。
   if (G.y + BIRD_R >= G.H - 14) return die('撞到地面');
   if (G.y - BIRD_R <= 0) return die('撞到天花板');
   for (const p of G.pipes) {
     const cx = Math.max(p.x, Math.min(G.birdX, p.x + PIPE_W));   // 矩形上最近的 x
     if ((G.birdX - cx) ** 2 > BIRD_R ** 2) continue;             // 水平还没够到
-    if (G.y - BIRD_R < p.top || G.y + BIRD_R > p.top + GAP) return die('撞上管子');
+    if (G.y - BIRD_R <= p.top + BIRD_R
+        || G.y + BIRD_R >= p.top + GAP - BIRD_R - 1) return die('撞上管子');
   }
 }
 function die(cause) { if (!G.dead) { G.dead = true; G.cause = cause; G.deadT = 0; } }

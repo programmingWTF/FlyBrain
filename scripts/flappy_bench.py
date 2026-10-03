@@ -242,10 +242,12 @@ class World:
             cx = max(p["x"], min(BIRD_X, p["x"] + PIPE_W))     # 矩形上离圆心最近的 x
             if (BIRD_X - cx) ** 2 > BIRD_R ** 2:
                 continue                                        # 水平还没够到
-            # 与 demo/app.js 的 physics() 逐字一致（整数算术，见那边的注释）：
-            #   圆周下沿 ceil(y+R) 越过 p.top+R，或圆周上沿 floor(y-R) 低于 p.top+GAP-R
-            if (math.ceil(self.y + BIRD_R) > p["top"] + BIRD_R
-                    or math.floor(self.y - BIRD_R) < p["top"] + GAP - BIRD_R):
+            # 与 demo/app.js 的 physics() 逐字一致（像素级判据，见那边的长注释）：
+            #   上管覆盖像素 [0, top+R]、下管覆盖像素 [top+GAP-R-1, ...]，
+            #   鸟圆周覆盖像素 [ceil(y-R), floor(y+R)]，有交集即撞 —— 化简后就是这两条。
+            #   demo/verify_collision_pixels.js 用逐像素对账守着（只画不判/只判不画必须为 0）。
+            if (self.y - BIRD_R <= p["top"] + BIRD_R
+                    or self.y + BIRD_R >= p["top"] + GAP - BIRD_R - 1):
                 return self.die("撞上管子")
 
     def die(self, cause: str) -> None:
