@@ -1,103 +1,105 @@
-// 画出来的管子 vs 碰撞判定用的管子 —— 逐像素核对，防止"看起来撞到了却不算"
-// 用法: node demo/verify_pipe_visual.js
+// 校验"画出来的管子"与"判定挡住的范围"逐像素一致 —— 覆盖**整幅画面的 x 范围**。
 //
-// 背景：原来管帽（capH=30）画在**缺口那一侧**，画出来的管子整整探进缺口 30px，
-// 而 physics() 的判定只认管体 [top, top+GAP]。于是"压着帽子飞过去不算撞"。
-// 这个脚本用一个只记录 fillRect/strokeRect 的**假 canvas** 复现绘制调用，
-// 把每个像素是否被画到算出来，再和碰撞判定逐像素比对。
+// ⚠️ 这里踩过一个致命盲区：旧版校验器把像素比较范围裁在 `[x, x+PIPE_W]`（管体宽度）内，
+//    而当时的 drawPipeSprite 在管体两侧各凸出 5px 画了一圈粗管口 ——
+//    凸出的 10px **有画面、没判定**，鸟压上去不死，而校验器因为裁剪压根没检查。
+//    现在管子就是一个矩形，且校验器**不再裁剪 x**，还额外断言管子不越出
+//    `[x, x+PIPE_W]`，从形状上杜绝这类问题。
+//
+// 判定（= D:/Code/DQN 的 FlappySim._collides，圆 vs 轴对齐矩形化简而来）：
+//     if (G.y - BIRD_R <= p.top || G.y + BIRD_R >= p.top + GAP) → 撞上管子
+// 用法: node demo/verify_pipe_visual.js
 const fs = require('fs');
 const path = require('path');
 
-// ---- 从 app.js 里抽出 drawPipeSprite 的源码，避免手抄漂移
-//     允许用 argv[2] 指定另一个文件（用来验证"这个测试确实能抓到旧 bug"）
-const srcPath = process.argv[2] || path.join(__dirname, 'app.js');
-const src = fs.readFileSync(srcPath, 'utf8');
-const start = src.indexOf('function drawPipeSprite');
-const end = src.indexOf('\nfunction drawGround');
-if (start < 0 || end < 0) throw new Error('找不到 drawPipeSprite / drawGround');
-const spriteSrc = src.slice(start, end);
+const src = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 
-const PIPE_W = 62, GAP = 168, G_H = 620, GROUND = 92;
+// ⚠️ 正则要能匹配**多变量声明**里的名字：GAP 写在
+//    `const GRAV = 1180, FLAP_V = -340, PIPE_W = 62, GAP = 184;` 里。
+function grabConst(name) {
+  const m = src.match(new RegExp('(?:^|[,;{(\\s])' + name + '\\s*=\\s*(-?[0-9.]+)'));
+  if (!m) throw new Error(`app.js 里找不到常量 ${name}`);
+  return Number(m[1]);
+}
+const GAP = grabConst('GAP');
+const BIRD_R = grabConst('BIRD_R');
+const PIPE_W = grabConst('PIPE_W');
+const G_H = 620;
+//: 最后一个还没撞地面的整数 y（判据 `y + BIRD_R >= G_H - 14` → 撞地面）
+const Y_MAX = G_H - 14 - BIRD_R - 1;
 
-// 假 canvas：记录矩形覆盖
+// ---- 抽 drawPipe
+const i0 = src.indexOf('function drawPipe(');
+if (i0 < 0) throw new Error('抽不到 drawPipe');
+const endM = /\n\}/.exec(src.slice(i0));
+if (!endM) throw new Error('找不到 drawPipe 的结尾');
+const fnSrc = src.slice(i0, i0 + endM.index + 2);
+
 function makeCtx(rec) {
   const grad = { addColorStop() {} };
-  const ctx = {
+  return {
     fillStyle: null, strokeStyle: null, lineWidth: 1,
     createLinearGradient: () => grad,
     fillRect(x, y, w, h) { rec.push([x, y, w, h]); },
     strokeRect(x, y, w, h) { rec.push([x, y, w, h]); },
     beginPath() {}, arc() {}, fill() {}, stroke() {}, save() {}, restore() {},
     ellipse() {}, moveTo() {}, lineTo() {}, closePath() {}, setLineDash() {},
-    fillText() {}, strokeText() {}, clip() {}, translate() {}, rotate() {},
+    fillText() {}, strokeText() {}, clip() {}, translate() {}, rotate() {}, scale() {},
   };
-  return ctx;
 }
+const drawPipe = new Function('PIPE_W', fnSrc + '; return drawPipe;')(PIPE_W);
 
-// 用 Function 构造出被测函数（与 app.js 同一份源码）
-const drawPipeSprite = new Function('PIPE_W', spriteSrc + '; return drawPipeSprite;')(PIPE_W);
-
-function rects(top, W = 520, H = 620) {
+/** 画一根 pipe（x 固定 100），返回其矩形列表。**保留全部矩形，不裁剪 x**。 */
+function rects(top) {
   const rec = [];
   const ctx = makeCtx(rec);
-  // ⚠️ 必须与 drawGame() 里的两处调用**逐字一致**：边界内缩一个鸟半径
-  //    （physics() 判的是鸟中心点，所以管子要画到"鸟身体真正碰到的位置"）。
-  const R = 11;
-  drawPipeSprite(ctx, 100, top + R, 0, R);              // 上管
-  drawPipeSprite(ctx, 100, top + GAP - R + 1, H, R);    // 下管
-  return rec.filter(([x, y, w, h]) => x < 100 + PIPE_W && x + w > 100 && h > 0);
+  // ⚠️ 必须与 drawGame() 里的两处调用逐字一致
+  drawPipe(ctx, 100, 0, top + BIRD_R + 1);
+  drawPipe(ctx, 100, top + GAP - BIRD_R, G_H);
+  return rec;
 }
 
-/** 把矩形裁到**管体宽度** [100, 100+PIPE_W] 再展开成 y —— 只有这部分是
- *  "玩家可能撞到的东西"。管口左右各多出 5px（capW = PIPE_W+10）是装饰性收边：
- *  鸟身宽 22px、中心固定在 birdX，整个身体都落在管体 x 区间内，那 5px 碰不到。 */
-function solidY(rec) {
-  const ys = new Set();
-  const x0 = 100, x1 = 100 + PIPE_W;
-  for (const [x, y, w, h] of rec) {
-    const l = Math.max(x, x0), r = Math.min(x + w, x1);
-    if (r - l < 1) continue;                       // 与管体宽度没有重叠
-    for (let yy = Math.ceil(y); yy < Math.ceil(y + h); yy++) ys.add(yy);
-  }
-  return [...ys].sort((a, b) => a - b);
-}
-
-// 碰撞判定：**逐字照抄 app.js physics() 的那一行**
-//     if (G.y - 11 < p.top || G.y + 11 > p.top + GAP) return die('撞上管子');
-// 注意鸟身有 2R 高，所以判定会**越过**管子边界各 R 像素。
-const BIRD_R = 11;
-const isBlocked = (y, top) => (y - BIRD_R < top) || (y + BIRD_R > top + GAP);
-
-// 鸟**实际可达**的 y 上界：physics() 里 `G.y > G.H - 14` 就撞地面，
-// 所以再往下早就是"撞到地面"了，不在"管子该不该挡"的讨论范围。
-const Y_MAX_REACHABLE = G_H - 14;   // 606
+const isBlocked = (y, top) => (y - BIRD_R <= top) || (y + BIRD_R >= top + GAP);
 
 let bad = 0;
-console.log('判据：在**鸟实际可达且在画布内**的 y 范围里，'
-          + '"被画到"的像素集合 必须恰好等于"判定挡住"的集合');
-console.log('（可达上界 = G.H-14（先判撞地面）；判定照抄 G.y-11 < top || G.y+11 > top+GAP）\n');
-console.log('top   | 比较域 | 画到 | 应挡 | 只画不挡 | 只挡不画');
-console.log('-'.repeat(62));
-for (const top of [70, 120, 200, 250, 300, 380, 402]) {
-  const drawn = new Set(solidY(rects(top)));
-  const lo = 0, hi = Math.min(Math.max(...drawn), Y_MAX_REACHABLE, G_H - 1);
-  let onlyPaint = 0, onlyBlock = 0, shouldBlock = 0, painted = 0;
-  for (let y = lo; y <= hi; y++) {
-    const blocked = isBlocked(y, top);
-    if (blocked) shouldBlock++;
-    if (drawn.has(y)) painted++;
-    if (drawn.has(y) && !blocked) onlyPaint++;
-    if (!drawn.has(y) && blocked) onlyBlock++;
+console.log(`从 app.js 读到的几何: GAP=${GAP}  BIRD_R=${BIRD_R}  PIPE_W=${PIPE_W}`);
+console.log('判据（= DQN 的圆-矩形测试）: y−R <= top  或  y+R >= top+GAP');
+console.log('比较范围: 全 x —— **不裁剪**（旧版裁在管体宽度内，漏掉了凸出的管口）\n');
+console.log('top   | 画到 | 应挡 | 只画不挡 | 只挡不画 | 越出管宽');
+console.log('-'.repeat(60));
+
+for (const top of [70, 120, 200, 250, 300, 340, G_H - GAP - 150]) {
+  const rec = rects(top);
+
+  // 1) 断言：管子不许越出 [x, x+PIPE_W]
+  let overhang = 0;
+  for (const [x, y, w, h] of rec) {
+    if (h <= 0) continue;
+    if (x < 100 - 1e-9 || x + w > 100 + PIPE_W + 1e-9) overhang = Math.max(overhang, 1);
   }
-  const ok = onlyPaint === 0 && onlyBlock === 0;
+
+  // 2) 逐像素：画到的集合 == 判定挡住的集合
+  const drawn = new Set();
+  for (const [x, y, w, h] of rec) {
+    if (h <= 0) continue;
+    for (let yy = Math.ceil(y); yy < Math.ceil(y + h); yy++) drawn.add(yy);
+  }
+  let onlyPaint = 0, onlyBlock = 0, painted = 0, should = 0;
+  for (let y = 0; y <= Y_MAX; y++) {
+    const b = isBlocked(y, top);
+    if (b) should++;
+    if (drawn.has(y)) painted++;
+    if (drawn.has(y) && !b) onlyPaint++;
+    if (!drawn.has(y) && b) onlyBlock++;
+  }
+  const ok = onlyPaint === 0 && onlyBlock === 0 && overhang === 0;
   if (!ok) bad++;
-  console.log(`${String(top).padEnd(6)}| ${String(lo).padStart(3)}..${String(hi).padStart(3)} | `
-            + `${String(painted).padStart(4)} | ${String(shouldBlock).padStart(4)} | `
-            + `${String(onlyPaint).padStart(8)} | ${String(onlyBlock).padStart(8)} `
-            + (ok ? '✅' : '❌'));
+  console.log(`${String(top).padEnd(6)}| ${String(painted).padStart(4)} | `
+    + `${String(should).padStart(4)} | ${String(onlyPaint).padStart(8)} | `
+    + `${String(onlyBlock).padStart(8)} | ${overhang ? '是 ❌' : '否'}  ` + (ok ? '✅' : '❌'));
 }
-console.log('-'.repeat(62));
+console.log('-'.repeat(60));
 console.log(bad === 0
-  ? '✅ 管口朝缺口、边界正好落在判定线上：画出来的管子 = 判定用的管子'
-  : `❌ 有 ${bad} 个 top 值不一致：画出来的管子与碰撞判定已经漂移`);
+  ? '✅ 管子 = 一个矩形，与判定逐像素一致，且不越出管宽'
+  : `❌ 有 ${bad} 个 top 值不一致`);
 process.exit(bad === 0 ? 0 : 1);

@@ -60,15 +60,18 @@ from fpv.spiking_brain import SpikingBrain  # noqa: E402
 # ------------------------------------------------------------------ 游戏常数（= app.js）
 G_W, G_H = 520, 620
 BIRD_X = 120
-BIRD_R = 11
+BIRD_R = 17
 GROUND = 92
-GAP = 168
+GAP = 184
 PIPE_W = 62
 PX_PER_M = 240.0
 SPACING = 300
 GRAV = 1180.0
 FLAP_V = -340.0
-WARM_S = 1.2                     # 开局悬空展示时长（= 前端 readyT）
+WARM_S = 0.8                     # 开局**加速期**时长（= demo/app.js 的 WARMUP_S）
+# 注意：这不再是一段'悬空假动画'。加速期照常走物理、也照常喂脑，只是不判碰撞。
+# 所以 **不能**再用 `if w.t < WARM_S: return []` 去门控投射 —— 那样脑在开局
+# 又变成没有输入，正是'起步直接跳死'的成因。
 TICK_S = 0.02
 FLAP_COOLDOWN = 0.14
 SPIKE_WINDOW = 5                 # dn01_recent 的窗口（tick）
@@ -197,10 +200,13 @@ class World:
         if self.dead:
             return
         self.t += dt
-        if self.t < WARM_S:                       # 开局悬空，不落体
-            self.y = 300.0 + math.sin(self.t * 3.3) * 10.0
-            self.vy = 0.0
-            return
+        # ---- 开局加速期：**照常走物理**（也照常喂脑 —— drive() 只在 t<WARM_S 时返回空，
+        #      那个门控已随页面一起去掉），只是**不判碰撞**。
+        # 为什么改（用户报"起步直接跳死"）：原来是假动画 `y = 300 + sin(...)` 悬空不落体，
+        # 这 1.2 秒里没有任何逼近刺激 → 脑驱动恒为 0；放开后鸟从 vy=0 自由落体，
+        # 而反射要膜电位积分 ~8 tick 才够阈值，管子却已按间距到达 → 起步必死。
+        # 现在与 demo/app.js 的 WARMUP_S 同步：真物理真喂脑，0.8s 后才开碰撞。
+        warm = self.t < WARM_S
         vpx = PX_PER_M                                # 管速 = 1 m/s
         if flap:
             self.vy = FLAP_V
@@ -219,14 +225,25 @@ class World:
         last = self.pipes[-1] if self.pipes else None
         if last is None or last["x"] < G_W - self.spacing():
             self._spawn(self._next_gap_top())
-        if self.y > G_H - 14:
+        if warm:
+            # 加速期只限制在画面内 —— 否则鸟一落地就死，比原来的假动画更糟。
+            # 与 demo/app.js 的 `warm` 分支逐字对应。
+            self.y = min(max(self.y, 40.0), float(G_H - GROUND - BIRD_R - 1))
+            return
+        # ---- 碰撞：**圆 vs 轴对齐矩形**，与 demo/app.js 以及
+        #      D:/Code/DQN 的 `FlappySim._collides` 同一判据。
+        #      (bx-cx)² + (by-cy)² <= r²，矩形竖直连续 → 化简为下面的 >= / <=。
+        #      用"<= / >="（触碰即算撞），与 DQN 一致。
+        if self.y + BIRD_R >= G_H - 14:
             return self.die("撞到地面")
-        if self.y < 6:
+        if self.y - BIRD_R <= 0:
             return self.die("撞到天花板")
         for p in self.pipes:
-            if BIRD_X + BIRD_R > p["x"] and BIRD_X - BIRD_R < p["x"] + PIPE_W:
-                if self.y - BIRD_R < p["top"] or self.y + BIRD_R > p["top"] + GAP:
-                    return self.die("撞上管子")
+            cx = max(p["x"], min(BIRD_X, p["x"] + PIPE_W))     # 矩形上离圆心最近的 x
+            if (BIRD_X - cx) ** 2 > BIRD_R ** 2:
+                continue                                        # 水平还没够到
+            if self.y - BIRD_R <= p["top"] or self.y + BIRD_R >= p["top"] + GAP:
+                return self.die("撞上管子")
 
     def die(self, cause: str) -> None:
         self.dead = True
@@ -631,8 +648,10 @@ class BiDirectionalProjection(GroundEquilibriumProjection):
         return y
 
     def drive(self, w: World):
-        if w.t < WARM_S:
-            return []
+        # ⚠️ 这里**不能**再门控 `w.t < WARM_S`。
+        # 加速期照常走物理、也照常喂脑（只是不判碰撞），所以脑从第一 tick 起就有输入。
+        # 原来的门控会让开局这 0.8~1.2 秒驱动恒为 0，等放开时鸟已在下坠、
+        # 膜电位还要再积 8 个 tick —— 那就是用户报的"起步直接跳死"。
         margin = float(self.spec.get("gap_margin", BIRD_R * 2))
         no_vent = bool(self.spec.get("no_ventral", 0))   # 消融：关掉爬升支（只留下潜）
         gap_c = w.gap_center()
@@ -1171,7 +1190,8 @@ class Harness:
                 want = self._lookahead(world, t_last_flap)
             else:
                 raise ValueError(policy)
-            if want and (world.t - t_last_flap) >= self.cooldown and world.t >= WARM_S:
+            # 不再要求 world.t >= WARM_S：页面在加速期也照常拍翅（脑一直在飞）
+            if want and (world.t - t_last_flap) >= self.cooldown:
                 flaps += 1
                 t_last_flap = world.t
             else:

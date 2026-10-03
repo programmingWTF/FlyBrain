@@ -68,7 +68,7 @@ const G = {
   scroll: 0, wingPhase: 0, started: false, manual: false,
   resp: null, hist: [], flashT: 0, dnFlash: 0,
 };
-const GRAV = 1180, FLAP_V = -340, PIPE_W = 62, GAP = 168;
+const GRAV = 1180, FLAP_V = -340, PIPE_W = 62, GAP = 184;
 //: 管子间距（px）。**按距离**生成，不按"上一根在哪"—— 物理子步数变化时后者会漏生成
 //: （没管子 = 没逼近刺激 = 反射不触发，看起来像脑子的错）。与评测台 SPACING 一致。
 const SPACING = 300;
@@ -76,7 +76,7 @@ const SPACING = 300;
 //:   `G.y - BIRD_R < p.top || G.y + BIRD_R > p.top + GAP`
 //: 即"判定体积 = 鸟中心 ± BIRD_R"。它必须与**画出来的鸟**一致，否则就会出现
 //: "看着碰到管子却不判定失败"。`demo/verify_bird_volume.js` 逐形状量着守它。
-const BIRD_R = 11;
+const BIRD_R = 17;
 //: 鸟的最大旋转角（弧度）。**只用于画眼睛/喙的朝向提示** —— 鸟身是一个正圆，
 //: 旋转不会改变它的外接范围（这正是用圆的好处之一）。
 const SPRITE_ROT_MAX = 0.30;
@@ -110,8 +110,22 @@ function bidiBody(ticks) {
 }
 
 
+//: 开局"加速期"时长（秒）。这段时间**正常走物理、也正常喂脑**，只是不判碰撞。
+//
+// 为什么必须这样（用户报"起步直接跳死"，查出来是这个）：
+// 原来前 1.2 秒是**假动画** —— `G.y = 300 + sin(...)` 悬空展示、不落体，
+// 于是这段时间**没有任何逼近刺激**，脑的驱动恒为 0（看着就是"游戏还没开始
+// 就在调和不跳之间反复决策"）。1.2 秒后突然放开：鸟从 vy=0 自由落体，
+// 而反射要**膜电位积分约 8 个 tick** 才够阈值，管子却按间距立刻到了 ——
+// 鸟还在加速下坠，第一根已经压到头上，于是起步就是死。
+//
+// 现在开局就是真物理真喂脑：鸟正常落体、脑从零开始积累驱动，
+// 0.8 秒足够它进入反射的极限环（实测落到 ~352 触发爬升、再约 8 tick 发放），
+// 同时第一根管子还远（约 1.9~2.6 秒才到），所以起步不再是必死。
+const WARMUP_S = 0.8;
+
 function resetGame() {
-  G.started = false; G.readyT = performance.now();
+  G.warmupT = 0;          // 加速期计时（见 WARMUP_S）
   G.y = 300; G.vy = 0; G.pipes = []; G.dead = false;
   G.deadT = 0; G.acc = 0; G.cooldown = 0; G.spawnT = 0; G.hist = [];
   G.pend = 0;              // 清掉积压的物理步，否则重开后鸟会先"冲"一段
@@ -210,17 +224,21 @@ function physics(dt) {
   G.dnFlash = Math.max(0, G.dnFlash - dt);
 
   if (G.dead) { G.deadT += dt; if (G.deadT > 1.6) resetGame(); return; }
-  if (!G.started) {                      // 前 1.2 秒悬空展示，然后交给反射
-    G.scroll += 60 * dt; G.y = 300 + Math.sin(performance.now() / 300) * 10;
-    G.wingT = (G.wingT || 0) + dt; G.wingPhase = Math.floor(G.wingT * 8) % 3;
-    if (G.readyT === undefined) G.readyT = performance.now();
-    if (performance.now() - G.readyT > 1200) { G.started = true; delete G.readyT; }
-    return;
-  }
+  // 开局加速期：**照常走物理、照常喂脑**（见 WARMUP_S 的说明），只是不判碰撞。
+  // 让鸟先进入反射的极限环、把膜电位积起来，管子到达时它已经会飞了。
+  G.warmupT = (G.warmupT || 0) + dt;
+  const warm = G.warmupT < WARMUP_S;
+
   G.scroll += P.spd * PX_PER_M * dt;
   G.wingT = (G.wingT || 0) + dt; G.wingPhase = Math.floor(G.wingT * 9) % 3;
   G.vy += GRAV * dt;
   G.y += G.vy * dt;
+  if (warm) {
+    // 加速期只限制在画面内（不判管子、也不判撞地/撞天花板），
+    // 否则鸟一落地就死，反而比原来的假动画更糟。
+    G.y = Math.min(Math.max(G.y, 40), G.H - GROUND - BIRD_R - 1);
+    return;
+  }
   const vpx = P.spd * PX_PER_M;
   // 按**间距**而不是时间生成：否则管速一慢，鸟会在下一根管子出现前摔死，
   // 而"没管子 = 没逼近刺激 = 反射不触发"，看起来就像脑子的错。
@@ -232,11 +250,18 @@ function physics(dt) {
     if (!p.passed && p.x + PIPE_W < G.birdX) { p.passed = true; G.score++; G.best = Math.max(G.best, G.score); }
   }
   G.pipes = G.pipes.filter(p => p.x > -PIPE_W - 10);
-  if (G.y > G.H - 14 || G.y < 6) return die(G.y > G.H - 14 ? '撞到地面' : '撞到天花板');
+  // ---- 碰撞：**圆 vs 轴对齐矩形**，与 D:/Code/DQN 的 `FlappySim._collides` 同一判据。
+  //      (bx-cx)² + (by-cy)² <= r²，其中 (cx,cy) 是矩形上离圆心最近的点，
+  //      管子就是两个矩形 [x, 0, PIPE_W, top] 和 [x, top+GAP, PIPE_W, ground]。
+  // 因为矩形竖直方向是连续的，最近点的 cy 恒等于 by，所以竖直条件化简为
+  //      by - r <= top   或   by + r >= top + GAP
+  // 用"<= / >="（触碰即算撞）与 DQN 一致；边界是坐标，画图那边按坐标-1 对齐像素。
+  if (G.y + BIRD_R >= G.H - 14) return die('撞到地面');
+  if (G.y - BIRD_R <= 0) return die('撞到天花板');
   for (const p of G.pipes) {
-    if (G.birdX + 11 > p.x && G.birdX - 11 < p.x + PIPE_W) {
-      if (G.y - 11 < p.top || G.y + 11 > p.top + GAP) return die('撞上管子');
-    }
+    const cx = Math.max(p.x, Math.min(G.birdX, p.x + PIPE_W));   // 矩形上最近的 x
+    if ((G.birdX - cx) ** 2 > BIRD_R ** 2) continue;             // 水平还没够到
+    if (G.y - BIRD_R <= p.top || G.y + BIRD_R >= p.top + GAP) return die('撞上管子');
   }
 }
 function die(cause) { if (!G.dead) { G.dead = true; G.cause = cause; G.deadT = 0; } }
@@ -282,24 +307,23 @@ function drawSky(g) {
  *  @param capInset 管口（粗的那圈）再往里挪多少像素 —— 让管口正好落在缺口侧边缘，
  *                  与标准 FlappyBird 的"管口朝着缺口"一致。传 0 就是紧贴 nearY。
  */
-function drawPipeSprite(g, x, nearY, farY, capInset) {
-  const capW = PIPE_W + 10, capH = 30;
-  const ins = capInset || 0;
-  const down = farY > nearY;                        // 管子从 nearY 往 +y 长（下管）
-  const bodyStart = Math.min(nearY, farY);
-  const bodyLen = Math.abs(nearY - farY);
+/** 画一根管子：**就是一个轴对齐矩形**（管宽 PIPE_W，从 y0 到 y1）。
+ *
+ *  为什么不再画"管口帽"：旧版在管体两侧各凸出 5px 画了一圈粗管口，而碰撞用的是
+ *  `[x, x+PIPE_W]` 的矩形 —— 凸出的那 10px **有画面、没判定**，鸟压上去不死。
+ *  （我当时的逐像素校验器把范围裁在管体宽度内，所以没抓到，是校验器的盲区。）
+ *  现在管子与判定是同一个矩形，形状上就不可能不一致。
+ *
+ *  `demo/verify_pipe_visual.js` 覆盖**整幅画面的 x 范围**逐像素对账，
+ *  并断言管子不越出 `[x, x+PIPE_W]`。 */
+function drawPipe(g, x, y0, y1) {
+  const top = Math.min(y0, y1), h = Math.abs(y1 - y0);
+  if (h <= 0) return;
   const body = g.createLinearGradient(x, 0, x + PIPE_W, 0);
   body.addColorStop(0, '#8ce350'); body.addColorStop(0.25, '#74bf2e');
   body.addColorStop(0.85, '#4e8a1c'); body.addColorStop(1, '#3d6d16');
-  g.fillStyle = body; g.fillRect(x, bodyStart, PIPE_W, bodyLen);
-  g.strokeStyle = '#2f5212'; g.lineWidth = 2; g.strokeRect(x, bodyStart, PIPE_W, bodyLen);
-  // 管口：占靠近 nearY 的 capH，再往里挪 ins（绝不越过 nearY）
-  const capY = down ? (nearY + ins) : (nearY - capH - ins);
-  const cg = g.createLinearGradient(x - 5, 0, x + capW - 5, 0);
-  cg.addColorStop(0, '#96ee58'); cg.addColorStop(0.3, '#74bf2e');
-  cg.addColorStop(1, '#3d6d16');
-  g.fillStyle = cg; g.fillRect(x - 5, capY, capW, capH);
-  g.strokeRect(x - 5, capY, capW, capH);
+  g.fillStyle = body; g.fillRect(x, top, PIPE_W, h);
+  g.strokeStyle = '#2f5212'; g.lineWidth = 2; g.strokeRect(x, top, PIPE_W, h);
   g.lineWidth = 1;
 }
 
@@ -362,25 +386,22 @@ function drawBirdSprite(g) {
 }
 
 function drawScoreBig(g) {
-  if (!G.started) return;
   g.font = 'bold 46px "Trebuchet MS", system-ui'; g.textAlign = 'center';
   g.lineWidth = 6; g.strokeStyle = '#5c4708'; g.fillStyle = '#fff';
   g.strokeText(String(G.score), G.W / 2, 74); g.fillText(String(G.score), G.W / 2, 74);
   g.textAlign = 'left'; g.lineWidth = 1;
 }
 
-function drawReady(g) {
-  g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(0, 0, G.W, G.H - GROUND);
+/** 开局加速期的提示。这段时间**脑已经在飞**（见 WARMUP_S），所以不是"准备中"，
+ *  而是"反射正在接管"—— 把这件事如实画出来。 */
+function drawWarmup(g) {
   g.textAlign = 'center';
-  g.font = 'bold 34px "Trebuchet MS", system-ui';
-  g.lineWidth = 6; g.strokeStyle = '#5c4708'; g.fillStyle = '#fff';
-  g.strokeText('冻结果蝇脑 · Flappy', G.W / 2, 190);
-  g.fillText('冻结果蝇脑 · Flappy', G.W / 2, 190);
-  g.font = '15px system-ui'; g.lineWidth = 0; g.fillStyle = '#0b2a2e';
-  g.fillText('脑完全冻结、零可学参数 —— 拍翅只来自 LC4→DNp01 逼近逃逸反射', G.W / 2, 224);
-  g.fillStyle = '#fff'; g.font = 'bold 20px system-ui';
-  g.fillText('按空格 / 点画面 你可以亲自接管拍翅试试', G.W / 2, 300);
-  g.textAlign = 'left';
+  g.font = 'bold 22px system-ui'; g.lineWidth = 0;
+  g.fillStyle = 'rgba(255,255,255,.85)';
+  g.fillText('反射接管中…', G.W / 2, 150);
+  g.font = '13px system-ui'; g.fillStyle = 'rgba(255,255,255,.55)';
+  g.fillText('冻结脑正在把逼近驱动积分到阈值', G.W / 2, 176);
+  g.textAlign = 'left'; g.lineWidth = 1;
 }
 function drawOverCard(g) {
   const w = 300, h = 150, x = (G.W - w) / 2, y = 200;
@@ -406,22 +427,17 @@ function drawGame() {
   // 只有 Flappy 一个模式（mode 已钉死），所以这里不再按模式分支。
   drawSky(g);
   for (const p of G.pipes) {
-    // 管口朝着缺口（标准 FlappyBird 的形状）。
-    //
-    // ⚠️ 边界要内缩一个**鸟半径**：physics() 判的是鸟**中心点**，所以对中心点而言
-    //    管子真正挡住的是 `y < top+R` / `y > top+GAP-R` 那两段。如果管子只画到 top，
-    //    就等于"看着碰到了（鸟身压着管口）却不算撞"。
-    // 注意边界是**坐标**，而"最后一个不该画的像素"是坐标-1：
-    //    y+R > top+GAP 不成立的最大整数 y 是 top+GAP-R，所以下管从 top+GAP-R+1 起画。
-    // 差 1 像素就会在缺口里多出一条"看着撞了却不算"的线，所以这里对齐到像素。
-    // demo/verify_pipe_visual.js 逐像素守着这一点。
-    drawPipeSprite(g, p.x, p.top + BIRD_R, 0, BIRD_R);                      // 上管
-    drawPipeSprite(g, p.x, p.top + GAP - BIRD_R + 1, G.H, BIRD_R);          // 下管
+    // 管子 = 矩形，边界与判定逐像素对齐（见 drawPipe 的说明）。
+    // `p.top` 是坐标；判定用 `y - R <= top`（碰上就算），所以上管画到 top+R+1、
+    // 下管从 top+GAP-R 起画。"最后一个被挡住的像素"比坐标大 1。
+    // demo/verify_pipe_visual.js 覆盖全 x 范围逐像素守着这一点。
+    drawPipe(g, p.x, 0, p.top + BIRD_R + 1);              // 上管
+    drawPipe(g, p.x, p.top + GAP - BIRD_R, G.H);          // 下管
   }
   drawGround(g);
   drawBirdSprite(g);
   drawScoreBig(g);
-  if (!G.started) drawReady(g);
+  if ((G.warmupT || 0) < WARMUP_S) drawWarmup(g);
 
   if (G.flashT > 0) { $('flash').className = 'on'; $('flash').innerHTML = '<span>跳!</span>'; }
   else $('flash').className = '';
@@ -677,7 +693,8 @@ function initUI() {
   // 手动拍翅：让人亲自试一下这个游戏有多难，体感比看数字直观
   const manual = () => {
     if (G.dead) return;
-    G.started = true; delete G.readyT; G.vy = FLAP_V; G.manual = true;
+    // 手动接管：直接结束加速期并给一次拍翅
+    G.warmupT = WARMUP_S; G.vy = FLAP_V; G.manual = true;
   };
   addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); manual(); } });
   $('game').addEventListener('pointerdown', manual);
