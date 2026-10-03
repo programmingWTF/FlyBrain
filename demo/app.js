@@ -345,38 +345,42 @@ function drawSky(g) {
   }
 }
 
-/** 画一段管体。
+/** 画一根管子。**管口（粗的那圈"帽"）朝着缺口**，与标准 FlappyBird 一致：
+ *      上管：帽在**下端**（朝下，贴着 top）    下管：帽在**上端**（朝上，贴着 top+GAP）
  *
- *  ⚠️ `capSide` 只允许画在**远离缺口**的那一端，绝不能画在缺口那一侧。
- *  这里踩过一个真 bug（用户实测："碰到管子不判定失败，下端更明显"）：
- *  原来两端都不管不顾地画 `capH=30` 的管帽，而管帽**正好贴在缺口那一侧**，于是
- *      上管帽覆盖 [top-30, top]        下管帽覆盖 [top+168-30, top+168+...]
- *  也就是说画出来的管子整整探进缺口 30px（左右还各多 5px），
- *  而碰撞判定（physics()）只认管体 `[top, top+168]`。
- *  → **画出来的缺口比判定用的缺口小 30px，鸟压着帽子飞过去不算撞。**
- *  两端都错，且视觉上不对称，所以看起来像"上下样式不同"。
+ *  参数用**两个边界**描述，避免"长度算两次"：
+ *      nearY = 贴缺口那一端 = 碰撞判定用的边界（上管 top / 下管 top+GAP）
+ *      farY  = 出画那一端（上管 0 / 下管画面底）
  *
- *  玩法判定本身一直是对的（缺口 = 168px，与 scripts/flappy_bench.py 逐字一致），
- *  错的是"画出来的 ≠ 判定的"。修法是让管帽只出现在缺口**反面**，
- *  这样画出来的缺口就等于判定用的缺口，不用去动任何物理与碰撞代码。
+ *  实现刻意写得最笨：管体先按"从 farY 到 nearY **整段**"画满，再把**靠近缺口
+ *  的 capH 那一段**换成管口。这样"管子的实心范围"永远恰好是 [farY, nearY)，
+ *  和碰撞判定用的区间逐像素对齐 —— 不会再出现前几版那种"帽让位让错方向、
+ *  管子比判定短 30px（缺口里于是有一条撞得到却画不出的缝）"。
+ *  `demo/verify_pipe_visual.js` 逐像素守着这一点。
  */
-function drawPipeSprite(g, x, yTop, hgt, withCap) {
-  const capH = 30;
+ *  @param nearY    包住缺口那一侧的**实心末端**（= 画到碰撞判定真正挡住的位置）
+ *  @param farY     出画那一端（上管 0 / 下管画面底）
+ *  @param capInset 管口（粗的那圈）再往里挪多少像素 —— 让管口正好落在缺口侧边缘，
+ *                  与标准 FlappyBird 的"管口朝着缺口"一致。传 0 就是紧贴 nearY。
+ */
+function drawPipeSprite(g, x, nearY, farY, capInset) {
+  const capW = PIPE_W + 10, capH = 30;
+  const ins = capInset || 0;
+  const down = farY > nearY;                        // 管子从 nearY 往 +y 长（下管）
+  const bodyStart = Math.min(nearY, farY);
+  const bodyLen = Math.abs(nearY - farY);
   const body = g.createLinearGradient(x, 0, x + PIPE_W, 0);
   body.addColorStop(0, '#8ce350'); body.addColorStop(0.25, '#74bf2e');
   body.addColorStop(0.85, '#4e8a1c'); body.addColorStop(1, '#3d6d16');
-  g.fillStyle = body; g.fillRect(x, yTop, PIPE_W, hgt);
-  g.strokeStyle = '#2f5212'; g.lineWidth = 2; g.strokeRect(x, yTop, PIPE_W, hgt);
-  if (withCap) {
-    // 管帽画在**远端**：yTop >= 0（下管）时贴在管体底部；否则（上管）贴在管体顶部
-    const capW = PIPE_W + 10;
-    const capY = yTop >= 0 ? yTop : yTop + hgt - capH;
-    const cg = g.createLinearGradient(x - 5, 0, x + capW - 5, 0);
-    cg.addColorStop(0, '#96ee58'); cg.addColorStop(0.3, '#74bf2e');
-    cg.addColorStop(1, '#3d6d16');
-    g.fillStyle = cg; g.fillRect(x - 5, capY, capW, capH);
-    g.strokeRect(x - 5, capY, capW, capH);
-  }
+  g.fillStyle = body; g.fillRect(x, bodyStart, PIPE_W, bodyLen);
+  g.strokeStyle = '#2f5212'; g.lineWidth = 2; g.strokeRect(x, bodyStart, PIPE_W, bodyLen);
+  // 管口：占靠近 nearY 的 capH，再往里挪 ins（绝不越过 nearY）
+  const capY = down ? (nearY + ins) : (nearY - capH - ins);
+  const cg = g.createLinearGradient(x - 5, 0, x + capW - 5, 0);
+  cg.addColorStop(0, '#96ee58'); cg.addColorStop(0.3, '#74bf2e');
+  cg.addColorStop(1, '#3d6d16');
+  g.fillStyle = cg; g.fillRect(x - 5, capY, capW, capH);
+  g.strokeRect(x - 5, capY, capW, capH);
   g.lineWidth = 1;
 }
 
@@ -462,10 +466,19 @@ function drawGame() {
   if (P.mode === 'flappy') {
     drawSky(g);
     for (const p of G.pipes) {
-      // 管帽只画在远离缺口的那一端（见 drawPipeSprite 的说明）：
-      // 上管 = 屏幕顶那端；下管 = 地面那端。
-      drawPipeSprite(g, p.x, 0, p.top, true);
-      drawPipeSprite(g, p.x, p.top + GAP, G.H - GROUND - p.top - GAP, true);
+      // 管口朝着缺口（标准 FlappyBird 的形状）。
+      //
+      // ⚠️ 边界要内缩一个**鸟半径**：physics() 判的是鸟**中心点**
+      //    （`G.y - 11 < top || G.y + 11 > top + GAP`），所以对中心点而言
+      //    管子真正挡住的是 `y < top+11` 那一段。如果管子只画到 top，
+      //    就等于"看着碰到了（鸟身压着管口）却不算撞" —— 这正是之前那个
+      //    "碰到管子不判定失败"的根源。画到"鸟身体真正会碰到的位置"才对得上。
+      // 注意边界是**坐标**，而"最后一个不该画的像素"是坐标-1：
+      //   y+11 > top+GAP 不成立的最大整数 y 是 top+GAP-11，所以下管从 top+GAP-11 起画。
+      // 差 1 像素就会在缺口里多出一条"看着撞了却不算"的线，所以这里对齐到像素。
+      const R = 11;                                  // = physics() 里的鸟半径
+      drawPipeSprite(g, p.x, p.top + R, 0, R);                    // 上管
+      drawPipeSprite(g, p.x, p.top + GAP - R + 1, G.H, R);        // 下管
     }
     drawGround(g);
     drawBirdSprite(g);
@@ -478,7 +491,7 @@ function drawGame() {
   }
 
 
-  if (G.flashT > 0) { $('flash').className = 'on'; $('flash').innerHTML = '<span>逃!</span>'; }
+  if (G.flashT > 0) { $('flash').className = 'on'; $('flash').innerHTML = '<span>跳!</span>'; }
   else $('flash').className = '';
   drawDeath(g);
 }

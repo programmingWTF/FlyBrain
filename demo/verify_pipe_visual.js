@@ -37,43 +37,67 @@ function makeCtx(rec) {
 // 用 Function 构造出被测函数（与 app.js 同一份源码）
 const drawPipeSprite = new Function('PIPE_W', spriteSrc + '; return drawPipeSprite;')(PIPE_W);
 
-function drawnAt(top, W = 520, H = 620) {
+function rects(top, W = 520, H = 620) {
   const rec = [];
   const ctx = makeCtx(rec);
-  // 与 drawGame() 里的两处调用完全一致
-  drawPipeSprite(ctx, 100, 0, top, true);                       // 上管
-  drawPipeSprite(ctx, 100, top + GAP, H - GROUND - top - GAP, true);  // 下管
-  // 把矩形展开成像素集合（只关心 y；x 用管体区间 [100, 100+PIPE_W)）
-  const px = new Set();
-  for (const [x, y, w, h] of rec) {
-    if (x > 100 + PIPE_W - 0.5 || x + w < 100 + 0.5) continue;   // 只算与管体 x 重叠的部分
-    for (let yy = Math.ceil(y); yy < Math.ceil(y + h); yy++) px.add(yy);
-  }
-  return px;
+  // ⚠️ 必须与 drawGame() 里的两处调用**逐字一致**：边界内缩一个鸟半径
+  //    （physics() 判的是鸟中心点，所以管子要画到"鸟身体真正碰到的位置"）。
+  const R = 11;
+  drawPipeSprite(ctx, 100, top + R, 0, R);              // 上管
+  drawPipeSprite(ctx, 100, top + GAP - R + 1, H, R);    // 下管
+  return rec.filter(([x, y, w, h]) => x < 100 + PIPE_W && x + w > 100 && h > 0);
 }
 
-// 碰撞判定：鸟（中心 y、半径 11）在管体 x 区间内时，哪些 y 算撞
+/** 把矩形裁到**管体宽度** [100, 100+PIPE_W] 再展开成 y —— 只有这部分是
+ *  "玩家可能撞到的东西"。管口左右各多出 5px（capW = PIPE_W+10）是装饰性收边：
+ *  鸟身宽 22px、中心固定在 birdX，整个身体都落在管体 x 区间内，那 5px 碰不到。 */
+function solidY(rec) {
+  const ys = new Set();
+  const x0 = 100, x1 = 100 + PIPE_W;
+  for (const [x, y, w, h] of rec) {
+    const l = Math.max(x, x0), r = Math.min(x + w, x1);
+    if (r - l < 1) continue;                       // 与管体宽度没有重叠
+    for (let yy = Math.ceil(y); yy < Math.ceil(y + h); yy++) ys.add(yy);
+  }
+  return [...ys].sort((a, b) => a - b);
+}
+
+// 碰撞判定：**逐字照抄 app.js physics() 的那一行**
+//     if (G.y - 11 < p.top || G.y + 11 > p.top + GAP) return die('撞上管子');
+// 注意鸟身有 2R 高，所以判定会**越过**管子边界各 R 像素。
 const BIRD_R = 11;
-function collides(y, top) { return (y - BIRD_R < top) || (y + BIRD_R > top + GAP); }
+const isBlocked = (y, top) => (y - BIRD_R < top) || (y + BIRD_R > top + GAP);
+
+// 鸟**实际可达**的 y 上界：physics() 里 `G.y > G.H - 14` 就撞地面，
+// 所以再往下早就是"撞到地面"了，不在"管子该不该挡"的讨论范围。
+const Y_MAX_REACHABLE = G_H - 14;   // 606
 
 let bad = 0;
-console.log('top   | 画到(缺口内)的像素                        | 判定为"不撞"却画到的 y 区间');
-console.log('-'.repeat(100));
+console.log('判据：在**鸟实际可达且在画布内**的 y 范围里，'
+          + '"被画到"的像素集合 必须恰好等于"判定挡住"的集合');
+console.log('（可达上界 = G.H-14（先判撞地面）；判定照抄 G.y-11 < top || G.y+11 > top+GAP）\n');
+console.log('top   | 比较域 | 画到 | 应挡 | 只画不挡 | 只挡不画');
+console.log('-'.repeat(62));
 for (const top of [70, 120, 200, 250, 300, 380, 402]) {
-  const px = drawnAt(top);
-  // 缺口 [top, top+GAP] 内被画到的 y
-  const inGap = [...px].filter(y => y >= top && y < top + GAP).sort((a, b) => a - b);
-  // 其中判定为"不撞"的（鸟中心落在这些 y 时不该撞，但却有管子的像素）
-  const falsePaint = inGap.filter(y => !collides(y, top));
-  if (falsePaint.length) bad++;
-  const rng = falsePaint.length
-    ? `${falsePaint[0]}..${falsePaint[falsePaint.length - 1]} (${falsePaint.length}px)`
-    : '—';
-  console.log(`${String(top).padEnd(6)}| ${String(inGap.length).padEnd(9)} px` +
-              `${''.padEnd(24)}| ${rng}`);
+  const drawn = new Set(solidY(rects(top)));
+  const lo = 0, hi = Math.min(Math.max(...drawn), Y_MAX_REACHABLE, G_H - 1);
+  let onlyPaint = 0, onlyBlock = 0, shouldBlock = 0, painted = 0;
+  for (let y = lo; y <= hi; y++) {
+    const blocked = isBlocked(y, top);
+    if (blocked) shouldBlock++;
+    if (drawn.has(y)) painted++;
+    if (drawn.has(y) && !blocked) onlyPaint++;
+    if (!drawn.has(y) && blocked) onlyBlock++;
+  }
+  const ok = onlyPaint === 0 && onlyBlock === 0;
+  if (!ok) bad++;
+  console.log(`${String(top).padEnd(6)}| ${String(lo).padStart(3)}..${String(hi).padStart(3)} | `
+            + `${String(painted).padStart(4)} | ${String(shouldBlock).padStart(4)} | `
+            + `${String(onlyPaint).padStart(8)} | ${String(onlyBlock).padStart(8)} `
+            + (ok ? '✅' : '❌'));
 }
-console.log('-'.repeat(100));
+console.log('-'.repeat(62));
 console.log(bad === 0
-  ? '✅ 画出来的管子与碰撞判定逐像素一致（缺口内没有任何被画到的像素）'
-  : `❌ 有 ${bad} 个 top 值下，缺口内被画到但不判定碰撞 —— 就是那个"碰到不算"的 bug`);
+  ? '✅ 管口朝缺口、边界正好落在判定线上：画出来的管子 = 判定用的管子'
+  : `❌ 有 ${bad} 个 top 值不一致：画出来的管子与碰撞判定已经漂移`);
 process.exit(bad === 0 ? 0 : 1);
