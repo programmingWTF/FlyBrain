@@ -15,11 +15,9 @@ const PX_PER_M = 240;              // 世界尺度：1 米 = 240 像素
 const TICK_S = 0.02;               // 脑的时钟：20ms/tick
 const FLAP_COOLDOWN = 0.14;        // 两次拍翅最小间隔（秒）
 
-// 严格模式（?strict=1）：与评测台同构的"脑决策 → 1 步物理"驱动。
-// 用途是**判定页面与评测台的差异到底在时序还是在算法**，不是给玩家用的模式。
-const STRICT = /[?&]strict=1\b/.test(location.search);
-//: 严格模式跑多少个 tick 就停（用于量分）。5000 tick = 100s 游戏时间。
-const STRICT_TICKS = 5000;
+// 注：原来有个 `?strict=1` 的"严格模式"，用来判定页面与评测台的差异是在
+// 时序还是在算法。**现在默认模式就是那个形状了**（脑响应驱动、决策与物理步严格
+// 1:1 配对，见 stepDriven / driveLoop），所以这个开关连同它的死代码一起删掉。
 // ?batch=N：一次向脑请求 N 个 tick（用于量"批大小 vs 速率/分数"的取舍）
 const BATCH_Q = Number((location.search.match(/[?&]batch=(\d+)/) || [])[1] || 0);
 
@@ -57,7 +55,9 @@ const FLAPPY = { maxClimb: 40, gapMargin: 18, vyGate: 1, ceilBoost: 1.0,
                  // batch=4 明显最好：批太小喂不饱脑（受 fetch 往返 ~70ms 限制），
                  // 批太大则视觉输入滞后太多、控制变钝。4 是这两者的折中。
                  batch: 4 };
-const S = { info: null, coords: null, ready: false };
+// pending: 当前在飞的 /api/step promise（由 driveLoop 消费，并配对刚好 1 步物理）
+const S = { info: null, coords: null, ready: false, pending: null,
+            resp: null, lit: null };
 
 // ---------------------------------------------------------------- 游戏状态
 const G = {
@@ -127,9 +127,10 @@ const WARMUP_S = 0.8;
 function resetGame() {
   G.warmupT = 0;          // 加速期计时（见 WARMUP_S）
   G.y = 300; G.vy = 0; G.pipes = []; G.dead = false;
-  G.deadT = 0; G.acc = 0; G.cooldown = 0; G.spawnT = 0; G.hist = [];
-  G.pend = 0;              // 清掉积压的物理步，否则重开后鸟会先"冲"一段
+  G.deadT = 0; G.cooldown = 0; G.spawnT = 0; G.hist = [];
   G.spawnAcc = 0;
+  // 清掉上一局残留的决策，否则重开后鸟会先「冲」一下
+  G.pendingFlap = false; G.pendingDnFlash = false;
   // 每一局都要归零。之前一次改动把这行弄丢了，导致撞死后分数跨局累加、
   // "最高"也跟着变成累计值 —— 看起来就是得分算错。
   G.score = 0;
@@ -184,31 +185,91 @@ async function post(path, body) {
 }
 
 let inFlight = false;
+/** 发一次脑请求（1 个 tick），**只负责发**，不做任何物理或状态更新。
+ *
+ *  响应由 `driveLoop()` 消费，并且**恰好**对应后续的 1 步物理 ——
+ *  这是"1:1"的实现方式，见 `stepDriven` 的说明。
+ *
+ *  @returns {boolean} true = 已发出；false = 上一个请求还在飞（调用方应稍后再试）
+ */
 function stepBrain(ticks) {
-  if (inFlight) return false;
-  // 只有 Flappy：双向逼近反射（方向由缺口在视野里的高低决定），
-  // 不再需要"最近碰撞"那套几何。
+  if (inFlight) { DBG.sbBusy = (DBG.sbBusy || 0) + 1; return false; }
   inFlight = true;
-  let body;
+  DBG.sbCalls = (DBG.sbCalls || 0) + 1;
   // 双向逼近反射（见 bidiBody 的说明）。物理常数与判据都没变，
   // "驱动哪些细胞"由缺口落在视野的哪一半决定。
-  body = bidiBody(ticks);
-  post('/api/step', body).then(r => {
-    if (r.error) { $('stat').textContent = '后端错误：' + r.error; return; }
-    S.resp = r;
-    G.hist.push(r.drive ?? r.drive_max ?? 0);
-    if (G.hist.length > 200) G.hist.shift();
-    if (r.flap && G.cooldown <= 0 && !G.dead) {
-      G.cooldown = FLAP_COOLDOWN; G.flashT = 0.12;
-      G.vy = FLAP_V;
-    }
-    if (r.dn01_recent > 0) G.dnFlash = 0.2;
-  }).catch(e => {
+  const body = bidiBody(ticks);
+  S.pending = post('/api/step', body).catch(e => {
     DBG.sbErr = (DBG.sbErr || 0) + 1;
-    DBG.sbErrMsg = String(e).slice(0, 120);
-    $('stat').textContent = '后端连接断了：' + e;
+    DBG.sbErrMsg = String(e).slice(0, 160);
+    const el = $('stat'); if (el) el.textContent = '后端连接断了：' + e;
+    return null;
   }).finally(() => { inFlight = false; DBG.sbFin = (DBG.sbFin || 0) + 1; });
   return true;
+}
+
+/** 推进**恰好一步**：先施加这一步应当采用的拍翅决策，再走 20ms 物理。
+ *
+ *  这是控制回路的正确形状 —— 与 `scripts/flappy_bench.py` 同构：
+ *      算几何 → 问脑 → **用这一步的决策** → 走这一步物理
+ *  决策与物理步严格配对，不是"先走物理再补拍翅"。
+ *
+ *  @param manual 玩家手动接管的那一下拍翅（空格/点击）
+ */
+function stepDriven(manual) {
+  const flap = manual || G.pendingFlap;
+  G.pendingFlap = false;
+  if (flap && G.cooldown <= 0 && !G.dead) {
+    G.cooldown = FLAP_COOLDOWN;
+    G.flashT = 0.12;
+    G.vy = FLAP_V;
+  }
+  if (G.pendingDnFlash) { G.dnFlash = 0.2; G.pendingDnFlash = false; }
+  physics(TICK_S);
+  DBG.physSteps++;
+}
+
+/** 脑响应驱动的推进循环：**不受帧率限制**。
+ *
+ *  为什么不能把它塞进 `requestAnimationFrame`：
+ *  无头/慢机器实测只有 **11.5 fps**，一帧一次决策 → 5.8 步/秒（=12% 速度），
+ *  鸟根本飞不起来。而服务端仿真只要 **1.73 ms/tick**，13.4 ms 的往返
+ *  几乎全是 HTTP 固定开销 —— 也就是说"脑够快，是帧率把它掐住了"。
+ *
+ *  所以让控制回路自行以 HTTP 往返的速度跑（实测可行 40~75 步/秒），
+ *  渲染循环只负责**显示最新状态**。两边彻底解耦。
+ *
+ *  它只在 `G.dead` 时短暂停手，把重置交给渲染循环（那里在画"撞了"的提示），
+ *  避免一撞就瞬间重开、玩家看不见。
+ */
+let driving = false;
+async function driveLoop() {
+  if (driving) return;
+  driving = true;
+  try {
+    while (true) {
+      if (G.dead) { await new Promise(r => setTimeout(r, 90)); continue; }
+      // 松开手时把积压的决策丢掉，避免"停一会儿之后连拍几下"
+      G.pendingFlap = false;
+      if (!stepBrain(1)) { await new Promise(r => setTimeout(r, 2)); continue; }
+      const step = S.pending;
+      S.pending = null;
+      const r = await step;
+      if (!r) { await new Promise(r => setTimeout(r, 10)); continue; }
+      DBG.brainTicks++;
+      DBG.sbOk = (DBG.sbOk || 0) + 1;
+      S.resp = r;
+      G.hist.push(r.drive ?? r.drive_max ?? 0);
+      if (G.hist.length > 200) G.hist.shift();
+      // 与服务端 `Session.step` 同构：**响应回来时才推进那一步物理**，
+      // 并且用的是这个响应自己的拍翅决策。
+      G.pendingFlap = !!(r.flap && G.cooldown <= 0 && !G.dead);
+      G.pendingDnFlash = (r.dn01_recent > 0);
+      stepDriven(false);
+    }
+  } finally {
+    driving = false;
+  }
 }
 
 function nearestPipe() {
@@ -223,7 +284,12 @@ function physics(dt) {
   G.flashT = Math.max(0, G.flashT - dt);
   G.dnFlash = Math.max(0, G.dnFlash - dt);
 
-  if (G.dead) { G.deadT += dt; if (G.deadT > 1.6) resetGame(); return; }
+  // ⚠️ 死亡后的"停一拍再重开"由**渲染循环**负责，不在这里。
+  //    原因：物理现在由 driveLoop 的脑响应驱动，而它在 G.dead 时会停手
+  //    （不再调 physics）→ 如果 deadT 还靠 physics 累加，就**永远涨不到 1.6s**、
+  //    鸟撞死之后永远不重开、分数定格（实测踩到：150 秒 0 分且 dead=1 卡住）。
+  //    所以 physics 在死亡态直接返回，计时交给 loop()。
+  if (G.dead) return;
   // 开局加速期：**照常走物理、照常喂脑**（见 WARMUP_S 的说明），只是不判碰撞。
   // 让鸟先进入反射的极限环、把膜电位积起来，管子到达时它已经会飞了。
   G.warmupT = (G.warmupT || 0) + dt;
@@ -720,7 +786,9 @@ function initUI() {
 // 踩过：`DBG.brainTicks++` 在 DBG 没有该字段时是 `undefined++` = **NaN**，
 // 而诊断脚本写的是 `d.brainTicks || 0`，NaN 就被显示成 0 —— 于是看起来像
 // "脑一个 tick 都没推进"，我照着这个假象查了很久的时序和服务器队列问题。
-const DBG = { frames: 0, brainTicks: 0, err: null, lastTs: null, G, P, S };
+const DBG = { frames: 0, brainTicks: 0, physSteps: 0, err: null, lastTs: null,
+              // 诊断：统计物理步/脑 tick 的真实比值，以及驱动被复用了几步
+              sbOk: 0, sbBusy: 0, pendMax: 0, G, P, S };
 window.__dbg = DBG;                 // 排障用：控制台读 __dbg.frames / __dbg.err
 window.G = G;                       // 排障用：控制台看当前分数 / 死因
 const PERF = { f: 0, last: 0, fps: 0 };
@@ -738,48 +806,23 @@ function loop(ts) {
     const dt = G.last ? Math.min(0.05, now - G.last) : 0;
     G.last = now;
 
-    // ---- 严格模式（?strict=1）：与评测台同构 —— "脑决策之后走恰好 1 步物理"。
+    // ---- 物理已经在 `driveLoop()` 里推进了（脑响应驱动，不受帧率限制）。
+    //      这里**只负责显示**最新状态 —— 两边彻底解耦，见 driveLoop 的长注释。
     //
-    // 为什么需要这个开关：页面实测 1~4 分、评测台 111 分，差两个数量级。
-    // 而 `scripts/flappy_page_parity.py` 号称验证过两边一致 —— 但它其实是
-    // `class PageWorld(fb.World)`，**继承了评测台**，比的是评测台自己。
-    // 所以"页面算法是否等价"从来没被真正验证过。这个开关就是那个对照：
-    //   开了还低分 → 算法本身与评测台不等价（真 bug，去查算法）
-    //   开了就正常 → 只是墙钟时序问题（去改时序）
-    if (STRICT) {
-      if (G.t < STRICT_TICKS * TICK_S) {
-        if (!brainBusy() && stepBrain(1)) { DBG.brainTicks++; physics(TICK_S); }
-      } else if (!DBG.strictDone) {
-        DBG.strictDone = true;
-        DBG.strictScore = G.score;
-        DBG.strictCause = G.cause || '存活到上限';
-      }
-    } else {
-      // 固定步长：物理按"脑 tick 数"推进，不按墙上时钟。
-      const ticks = Math.floor((G.acc = Math.min(G.acc + dt, 0.3)) / TICK_S);
-      // 批大小：一次请求向脑要几个 tick。
-      //
-      // 为什么可以 >1（推翻我之前的判断）：一次请求带回 N 个 tick 时，N 步物理
-      // **各自**都用同一个拍翅决策 —— 也就是控制回路本来就是按脑的决策率离散运行的，
-      // 并不是"物理跑在脑前面"。唯一代价是视觉输入最多滞后 N 个 tick。
-      // 而实测浏览器只能做到 14.3 req/s（需要 50 才 1:1 实时），
-      // 所以批大小是唯一能把速率提上来的旋钮 —— 到底值不值，直接量。
-      if (ticks > 0 && stepBrain(FLAPPY.batch)) {
-        const n = Math.min(ticks, FLAPPY.batch);
-        G.acc -= n * TICK_S; DBG.brainTicks += n;
-        // ⚠️ 不在这里一口气走完 n 步物理，而是**排队分帧走**。
-        //
-        // 为什么：一帧走 4 步、下一帧走 0 步，画面就是一卡一卡（用户报的抖动）。
-        // 分帧走不改变任何物理结果 —— 同样的步数、同样的拍翅决策、同样的顺序，
-        // 只是把冲量摊到后续帧，所以判定与评测台仍逐 tick 一致，
-        // 而鸟的位置在屏幕上连续移动。
-        G.pend = Math.min(64, (G.pend || 0) + n);
-      } else if (ticks === 0) {
-        physics(TICK_S);          // 不足一个 tick 也给一帧物理，保持画面连续
-      }
-    }
-    // 把积压的物理步按帧消化（每帧最多 1 步，避免一帧跳一大段）
-    if (G.pend > 0 && !STRICT) { physics(TICK_S); G.pend--; }
+    //      历史（我在这里错过好几轮，把结论留下）：
+    //        ❌ 物理跟墙钟走（G.acc += dt，要 50 步/秒）+ pend 每帧只消化 1 步
+    //           → 帧率低于 50fps 就崩：pend 涨到上限 64、决策积压几十步
+    //        ❌ 物理跟帧率走（每帧 1 步）
+    //           → 与脑严格 1:1 了，但帧率 11.5fps 就只有 5.8 步/秒（12% 速度）
+    //              鸟慢到飞不起来
+    //        ✅ 物理跟**脑响应**走（当前）
+    //           → 服务端仿真 1.73ms/tick，13.4ms 的往返几乎全是 HTTP 开销，
+    //             所以控制回路能跑到 40~75 步/秒，**与渲染帧率无关**
+    if (!driving) driveLoop();
+    // 死亡后的重开计时：必须用**帧时钟**。
+    // 物理在 G.dead 时不推进（driveLoop 停手），所以 deadT 不能靠物理累加 ——
+    // 否则撞死后永远重不开（实测卡死：150 秒 0 分、dead=1）。
+    if (G.dead) { G.deadT += dt; if (G.deadT > 1.6) resetGame(); }
     // 排障遥测：每 ~0.5s 记一行
     if (PERF && (ts - (DBG.telTs || 0)) > 500) {
       DBG.telTs = ts;
