@@ -164,7 +164,7 @@ demo/server.py 的 /api/step 返回 `eff` 和 `need`：
 2. 仍有 19% 的局 ≤2 分（连续多根都要求爬升时累积）。
 3. **dt 20ms → 1ms 重测**（从未做过，最大的科学短板；真实 GF 通路 1.4–25ms）。
 4. **已做**：`bidi` 已接进演示（`demo/server.py` + `demo/app.js`），
-   页面与评测台的一致性由 `scripts/flappy_page_parity.py` 核对（均分比 0.85）。
+   服务端与评测台的物理一致性由 `scripts/verify_server_physics.py` 逐 tick 核对（现已逐 tick 等价）。
 5. 严格负结果：三方对照（真图 / 度保持重连 / ER 随机图）× 多随机种子。
    已有 `cut`/`shuffled`/`LC10a` 三个强对照，缺度保持重连与多种子。
 
@@ -210,7 +210,7 @@ demo/server.py 的 /api/step 返回 `eff` 和 `need`：
 **下一步（按性价比）**
 1. **dt 20ms → 1ms 重测**（仍未做，最大的科学短板；真实 GF 通路是 1.4–25ms）。
 2. **已做**：`bidi` 已接进演示（`demo/server.py` 加双向投射 + `demo/app.js` 用页面自己的
-   算法复现，一致性由 `scripts/flappy_page_parity.py` 核对）。
+   算法复现，一致性由 `scripts/verify_server_physics.py` 逐 tick 核对）。
 3. 想继续冲分：主要缺口是"前瞻"。反射只能在**已经朝某个大面快速靠近**时启动
    （60 局里 34 局仍撞管），而 lookahead 能到 34.6。可试的真实机制方向：
    管壁作为"带洞的迎面墙"（洞的位置决定哪一半视野不被驱动）而不是局部小物体。
@@ -268,7 +268,8 @@ demo/server.py 的 /api/step 返回 `eff` 和 `need`：
    × 多随机种子，报均值±方差。**注意本轮已给出两个强对照**：`shuffled` 0 分、
    换 LC10a 0 分 —— 负结果这条已经有骨架了，缺的是多随机种子与度保持重连。
 4. **已做**：`bidi` 已接进演示 —— 页面上的分数现在与本节数字同源
-   （页面 27.0 / 评测台 31.9，比值 0.85，见 `scripts/flappy_page_parity.py`）。
+   （当时页面 27.0 / 评测台 31.9，比值 0.85。**这个差距后来从根上解决了**：
+仿真搬到服务端，两边从此跑同一份物理。）
 
 ---
 

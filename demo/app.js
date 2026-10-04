@@ -87,188 +87,103 @@ const SPRITE_ROT_MAX = 0.30;
  *  vy_gate 在后端做（地面只在下落时逼近、天花板只在上升时逼近）。
  *  距离沿用同一套"等效半宽 0.55"的写法，与 scripts/flappy_bench.py 一致。
  */
-function bidiBody(ticks) {
-  const gapC = nearestPipe() ? nearestPipe().top + GAP / 2 : G.H / 2;
-  const up = gapC < G.y - FLAPPY.gapMargin;
-  const hPx = Math.max(up ? (G.H - GROUND) - G.y : G.y, 1);
-  const dist = Math.max(hPx / PX_PER_M, 0.02);
-  const thetaDeg = 180 / Math.PI * 2 * Math.atan(0.55 / dist);
-  const n = FLAPPY.n, s50 = FLAPPY.s50size;
-  const x = Math.pow(Math.max(thetaDeg, 0), n);
-  const amp = x / (x + Math.pow(s50, n));
-  G.geo = { theta_deg: thetaDeg,
-            dtheta_dps: 180 / Math.PI * (0.55 / Math.max(dist, 1e-3)),
-            tau_s: dist };
-  G.cov = amp;
-  return { ticks, need_spikes: P.need,
-           drives: [{ type: 'bidi', y: G.y, vy: G.vy, gap: gapC,
-                      ground_y: G.H - GROUND, s50size: s50, n: n,
-                      gap_margin: FLAPPY.gapMargin, vy_gate: FLAPPY.vyGate,
-                      ceil_boost: FLAPPY.ceilBoost, groups: FLAPPY.groups,
-                      dors_scale: FLAPPY.dorsScale, vent_gain: FLAPPY.ventGain,
-                      vent_dev: FLAPPY.ventDev }] };
-}
-
-
-//: 开局"加速期"时长（秒）。这段时间**正常走物理、也正常喂脑**，只是不判碰撞。
+// ============================================================ 与服务端同步
 //
-// 为什么必须这样（用户报"起步直接跳死"，查出来是这个）：
-// 原来前 1.2 秒是**假动画** —— `G.y = 300 + sin(...)` 悬空展示、不落体，
-// 于是这段时间**没有任何逼近刺激**，脑的驱动恒为 0（看着就是"游戏还没开始
-// 就在调和不跳之间反复决策"）。1.2 秒后突然放开：鸟从 vy=0 自由落体，
-// 而反射要**膜电位积分约 8 个 tick** 才够阈值，管子却按间距立刻到了 ——
-// 鸟还在加速下坠，第一根已经压到头上，于是起步就是死。
+// ⚠️ 这一整块是 **服务端权威** 的接入点：前端**不再自己算物理、也不再自己喂脑**。
 //
-// 现在开局就是真物理真喂脑：鸟正常落体、脑从零开始积累驱动，
-// 0.8 秒足够它进入反射的极限环（实测落到 ~352 触发爬升、再约 8 tick 发放），
-// 同时第一根管子还远（约 1.9~2.6 秒才到），所以起步不再是必死。
-const WARMUP_S = 0.8;
+// 为什么必须这么改（我把前端的四种驱动方式都试遍了，每次都实测）：
+//   ① 物理跟墙钟走 + pend 每帧 1 步  → 帧率 <50fps 就积压几十步、鸟控不住
+//   ② 物理跟帧率走                    → 帧率 11.5fps 只有 12% 速度、飞不起来
+//   ③ 物理跟脑响应走                  → 速度 = HTTP 往返速度 → 时快时慢
+//   ④ 固定节拍 + 决策队列预取          → 队列周期性见底，仍然抖
+// 根因是结构性的：**游戏时钟必须挂在某个节奏上**，而浏览器里两个可选项实测都不行：
+//      setTimeout(4)          → 29.8 次/s（被压到 ~33ms）
+//      requestAnimationFrame  → 28.2 次/s（后台还会完全暂停）
+// 再加上 HTTP 往返中位 60ms、p90 86ms、最快 4ms（差十几倍）——
+// 只要决策要靠一次跨进程往返拿到，时钟就一定是抖的。
+//
+// 所以把它搬到服务端：脑与物理在**同一个进程、同一个锁**里按固定 50 Hz 跑 1:1
+// （见 server.py 的 GameWorld / _game_tick）。前端只做两件事：
+//      ① 按自己的帧率**取状态**（取晚了只影响画面新鲜度，不影响游戏速度）
+//      ② 把两次状态**插值**后画出来（所以画面是 60fps 流畅的）
+// 实测服务端速率：**50.0 步/秒，偏差 +0.1%**。
 
-function resetGame() {
-  G.warmupT = 0;          // 加速期计时（见 WARMUP_S）
-  G.y = 300; G.vy = 0; G.pipes = []; G.dead = false;
-  G.deadT = 0; G.cooldown = 0; G.spawnT = 0; G.hist = [];
-  G.spawnAcc = 0;
-  // 清掉上一局残留的决策，否则重开后鸟会先「冲」一下
-  G.pendingFlap = false; G.pendingDnFlash = false;
-  // 每一局都要归零。之前一次改动把这行弄丢了，导致撞死后分数跨局累加、
-  // "最高"也跟着变成累计值 —— 看起来就是得分算错。
-  G.score = 0;
-  {
-    // 开局就得有管子、而且不能太远：第一版栽在两个自锁上 ——
-    //  (a) 没管子 -> 没刺激 -> 反射不触发 -> 摔死 -> 重置 -> 还是没管子；
-    //  (b) 管子从 1.4 米外开始，而鸟 0.72 秒落地，反射来不及救它。
-    G.pipes.push({ x: G.birdX + 0.75 * PX_PER_M - PIPE_W, top: 250, passed: false });
-  }
-}
-
-/** 关卡生成：加上"相邻缺口的向上跳变 ≤ maxClimb"的可达性约束。
- *
- *  为什么必须加（ESCAPE.md §6.1~6.3 实测）：鸟的可持续爬升率只有 ~100 px/s，
- *  管距 300px / 240px·s⁻¹ = 1.25s，一个间隔最多爬 ~125px；而原来
- *  `70 + rand*(G.H-GAP-150)` 的缺口中心跳变有 330px 量程 —— 超出的关卡
- *  在给定物理下无论如何都飞不进去（早死局实测 42/53 是"鸟偏低没爬够"）。
- *  **向下不设限**：自由落体快得多（1.25s 可掉 921px，远超量程）。
- *  管宽、缺口高、管速、重力一个都没改。
- */
-function spawnPipe() {
-  const lo = 70, hi = G.H - GAP - 150;          // 与原来同一个分布范围
-  const last = G.pipes[G.pipes.length - 1];
-  let gapTop, x;
-  if (!last) {
-    // ⚠️ 第 1 根必须**和评测台逐字一致**：top=250（缺口中心 334），
-    // 而且开局就在 x = birdX + 0.75*PX_PER_M - PIPE_W = 238，
-    // 不是生成在屏幕右缘（550）等 5.2 秒才到。
-    //
-    // 原来这里是"随机 gapTop + 生成在右缘"。随机让缺口中心可能远在鸟上方
-    // （中心 154~386 vs 鸟起始 300），而 ventGain=2.0 会为追它猛爬、
-    // 冲过缺口后拉不回来 —— 实测页面 100% 死在管 1/管 2（死亡 y 都在 190~232，
-    // 即"爬过头"）。评测台用固定 250，开局是"鸟比缺口中心高 34px"这种温和局面。
-    gapTop = 250;
-    x = G.birdX + 0.75 * PX_PER_M - PIPE_W;
+/** 从服务端同步来的权威状态（后端的 _game_tick 每 50ms 更新一次）。 */
+function applyServerState(st) {
+  if (!st || st.error) return;
+  G.t = st.t;
+  G.y = st.y;
+  G.vy = st.vy;
+  G.prevY = (G.srvY === undefined) ? st.y : G.srvY;
+  G.srvY = st.y;
+  G.score = st.score; G.best = st.best;
+  G.dead = !!st.dead; G.cause = st.cause || '';
+  G.flapT = st.flap_t;
+  // 管道：服务端发的是 [x, top]
+  const ps = st.pipes || [];
+  // 复用已有对象（避免每帧新建，也让插值能拿到上一帧的 x）
+  if (!G.pipes || G.pipes.length !== ps.length) {
+    G.pipes = ps.map(([x, top]) => ({ x, top, px: x, passed: false }));
   } else {
-    const prevC = last.top + GAP / 2;           // 上一根缺口中心
-    const topMax = Math.min(hi, prevC + FLAPPY.maxClimb - GAP / 2);
-    gapTop = topMax > lo ? lo + Math.random() * (topMax - lo) : lo;
-    x = G.W + 30;
-  }
-  G.pipes.push({ x, top: gapTop, passed: false });
-}
-
-// ---------------------------------------------------------------- 后端通信
-async function post(path, body) {
-  const r = await fetch(path, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  });
-  return r.json();
-}
-
-let inFlight = false;
-/** 发一次脑请求（1 个 tick），**只负责发**，不做任何物理或状态更新。
- *
- *  响应由 `driveLoop()` 消费，并且**恰好**对应后续的 1 步物理 ——
- *  这是"1:1"的实现方式，见 `stepDriven` 的说明。
- *
- *  @returns {boolean} true = 已发出；false = 上一个请求还在飞（调用方应稍后再试）
- */
-function stepBrain(ticks) {
-  if (inFlight) { DBG.sbBusy = (DBG.sbBusy || 0) + 1; return false; }
-  inFlight = true;
-  DBG.sbCalls = (DBG.sbCalls || 0) + 1;
-  // 双向逼近反射（见 bidiBody 的说明）。物理常数与判据都没变，
-  // "驱动哪些细胞"由缺口落在视野的哪一半决定。
-  const body = bidiBody(ticks);
-  S.pending = post('/api/step', body).catch(e => {
-    DBG.sbErr = (DBG.sbErr || 0) + 1;
-    DBG.sbErrMsg = String(e).slice(0, 160);
-    const el = $('stat'); if (el) el.textContent = '后端连接断了：' + e;
-    return null;
-  }).finally(() => { inFlight = false; DBG.sbFin = (DBG.sbFin || 0) + 1; });
-  return true;
-}
-
-/** 推进**恰好一步**：先施加这一步应当采用的拍翅决策，再走 20ms 物理。
- *
- *  这是控制回路的正确形状 —— 与 `scripts/flappy_bench.py` 同构：
- *      算几何 → 问脑 → **用这一步的决策** → 走这一步物理
- *  决策与物理步严格配对，不是"先走物理再补拍翅"。
- *
- *  @param manual 玩家手动接管的那一下拍翅（空格/点击）
- */
-function stepDriven(manual) {
-  const flap = manual || G.pendingFlap;
-  G.pendingFlap = false;
-  if (flap && G.cooldown <= 0 && !G.dead) {
-    G.cooldown = FLAP_COOLDOWN;
-    G.flashT = 0.12;
-    G.vy = FLAP_V;
-  }
-  if (G.pendingDnFlash) { G.dnFlash = 0.2; G.pendingDnFlash = false; }
-  physics(TICK_S);
-  DBG.physSteps++;
-}
-
-/** 脑响应驱动的推进循环：**不受帧率限制**。
- *
- *  为什么不能把它塞进 `requestAnimationFrame`：
- *  无头/慢机器实测只有 **11.5 fps**，一帧一次决策 → 5.8 步/秒（=12% 速度），
- *  鸟根本飞不起来。而服务端仿真只要 **1.73 ms/tick**，13.4 ms 的往返
- *  几乎全是 HTTP 固定开销 —— 也就是说"脑够快，是帧率把它掐住了"。
- *
- *  所以让控制回路自行以 HTTP 往返的速度跑（实测可行 40~75 步/秒），
- *  渲染循环只负责**显示最新状态**。两边彻底解耦。
- *
- *  它只在 `G.dead` 时短暂停手，把重置交给渲染循环（那里在画"撞了"的提示），
- *  避免一撞就瞬间重开、玩家看不见。
- */
-let driving = false;
-async function driveLoop() {
-  if (driving) return;
-  driving = true;
-  try {
-    while (true) {
-      if (G.dead) { await new Promise(r => setTimeout(r, 90)); continue; }
-      // 松开手时把积压的决策丢掉，避免"停一会儿之后连拍几下"
-      G.pendingFlap = false;
-      if (!stepBrain(1)) { await new Promise(r => setTimeout(r, 2)); continue; }
-      const step = S.pending;
-      S.pending = null;
-      const r = await step;
-      if (!r) { await new Promise(r => setTimeout(r, 10)); continue; }
-      DBG.brainTicks++;
-      DBG.sbOk = (DBG.sbOk || 0) + 1;
-      S.resp = r;
-      G.hist.push(r.drive ?? r.drive_max ?? 0);
-      if (G.hist.length > 200) G.hist.shift();
-      // 与服务端 `Session.step` 同构：**响应回来时才推进那一步物理**，
-      // 并且用的是这个响应自己的拍翅决策。
-      G.pendingFlap = !!(r.flap && G.cooldown <= 0 && !G.dead);
-      G.pendingDnFlash = (r.dn01_recent > 0);
-      stepDriven(false);
+    for (let i = 0; i < ps.length; i++) {
+      G.pipes[i].px = G.pipes[i].x;
+      G.pipes[i].x = ps[i][0];
+      G.pipes[i].top = ps[i][1];
     }
+  }
+  G.srvT = st.t;
+  // 加速期的显示由**服务端时间**推导（服务端才是权威，别再本地积分一遍）
+  G.warmupT = Math.max(G.warmupT || 0, st.t);
+  G.srvRx = performance.now() / 1000;
+  // ---- 画图要用的脑侧量。
+  // 原来这些来自前端自己那次 /api/step 的响应；改成服务端权威后必须从
+  // 状态快照里拿，否则**3D 脑图会静默变空、驱动曲线也不动**（不报错，很隐蔽）。
+  S.resp = {
+    eff: st.eff, need: st.need,
+    dn01_recent: st.dn01_recent,
+    drive: (st.plan && st.plan.amp) || 0,
+    plan: st.plan || {},
+    viz_spike: st.viz_spike || [],
+    lit_spike: st.lit_spike || [],
+  };
+  // 驱动曲线：原来由前端脑循环 push，现在从快照里取（否则曲线永远是一条平线）。
+  // 画的是"这一步的角尺寸驱动量" amp，与阈值 r50 比较 —— 见 drawDrive。
+  G.hist.push((st.plan && st.plan.amp) || 0);
+  if (G.hist.length > 200) G.hist.shift();
+  G.srvStats = { rate: st.rate, ticks: st.ticks, flaps: st.flaps, sim_hz: st.sim_hz };
+  if (st.dn01_recent > 0) G.dnFlash = 0.2;
+}
+
+/** 取状态：**单飞**（上一次没回来就不发新的），避免请求堆积。 */
+let fetching = false;
+async function pollGame() {
+  if (fetching) return;
+  fetching = true;
+  try {
+    const r = await fetch('/api/game/state', { cache: 'no-store' });
+    applyServerState(await r.json());
+  } catch (e) {
+    DBG.err = '取状态失败：' + e;
   } finally {
-    driving = false;
+    fetching = false;
+  }
+}
+
+/** 渲染用插值：服务端 50 Hz、屏幕 60 fps，所以在两次状态之间按**本地墙钟**
+ *  把鸟和管子推进到当前时刻，画面才连续（否则会一卡一卡）。
+ *  只影响显示；判定完全在服务端。 */
+function interpolate() {
+  if (G.srvStats === undefined) return;
+  const now = performance.now() / 1000;
+  let a = now - G.srvRx;
+  if (a < 0) a = 0;
+  if (a > 0.2) a = 0.2;                       // 别插太远
+  if (!G.dead && G.srvT !== undefined && G.srvT >= WARMUP_S) {
+    G.y = G.srvY + G.vy * a;                  // 匀速外推（一个 tick 内 vy 变化极小）
+    const dx = PX_PER_M * a * P.spd;
+    for (const p of G.pipes) {
+      if (p.px !== undefined) p.x = p.px - dx;   // 管子匀速左移，外推是精确的
+    }
   }
 }
 
@@ -278,72 +193,6 @@ function nearestPipe() {
   return best;
 }
 
-// ---------------------------------------------------------------- 物理
-function physics(dt) {
-  G.cooldown = Math.max(0, G.cooldown - dt);
-  G.flashT = Math.max(0, G.flashT - dt);
-  G.dnFlash = Math.max(0, G.dnFlash - dt);
-
-  // ⚠️ 死亡后的"停一拍再重开"由**渲染循环**负责，不在这里。
-  //    原因：物理现在由 driveLoop 的脑响应驱动，而它在 G.dead 时会停手
-  //    （不再调 physics）→ 如果 deadT 还靠 physics 累加，就**永远涨不到 1.6s**、
-  //    鸟撞死之后永远不重开、分数定格（实测踩到：150 秒 0 分且 dead=1 卡住）。
-  //    所以 physics 在死亡态直接返回，计时交给 loop()。
-  if (G.dead) return;
-  // 开局加速期：**照常走物理、照常喂脑**（见 WARMUP_S 的说明），只是不判碰撞。
-  // 让鸟先进入反射的极限环、把膜电位积起来，管子到达时它已经会飞了。
-  G.warmupT = (G.warmupT || 0) + dt;
-  const warm = G.warmupT < WARMUP_S;
-
-  G.scroll += P.spd * PX_PER_M * dt;
-  G.wingT = (G.wingT || 0) + dt; G.wingPhase = Math.floor(G.wingT * 9) % 3;
-  G.vy += GRAV * dt;
-  G.y += G.vy * dt;
-  if (warm) {
-    // 加速期只限制在画面内（不判管子、也不判撞地/撞天花板），
-    // 否则鸟一落地就死，反而比原来的假动画更糟。
-    G.y = Math.min(Math.max(G.y, 40), G.H - GROUND - BIRD_R - 1);
-    return;
-  }
-  const vpx = P.spd * PX_PER_M;
-  // 按**间距**而不是时间生成：否则管速一慢，鸟会在下一根管子出现前摔死，
-  // 而"没管子 = 没逼近刺激 = 反射不触发"，看起来就像脑子的错。
-  const spacing = 300;
-  const lastP = G.pipes[G.pipes.length - 1];
-  if (!lastP || lastP.x < G.W - spacing) spawnPipe();
-  for (const p of G.pipes) {
-    p.x -= vpx * dt;
-    if (!p.passed && p.x + PIPE_W < G.birdX) { p.passed = true; G.score++; G.best = Math.max(G.best, G.score); }
-  }
-  G.pipes = G.pipes.filter(p => p.x > -PIPE_W - 10);
-  // ---- 碰撞：鸟（圆）与管子（矩形）。
-  //
-  // ⚠️ 竖直判据是**像素级**推出来的，不要再"化简"，很容易差 1px。
-  //    `fillRect(y, h)` 覆盖像素 y … y+h-1（**闭区间**），而 drawGame 里
-  //      上管 = drawPipe(g, p.x, 0, p.top+R+1)        → 覆盖像素 [0, p.top+R]
-  //      下管 = drawPipe(g, p.x, p.top+GAP-R-1, G.H)  → 覆盖像素 [p.top+GAP-R-1, …]
-  //    鸟圆周覆盖像素 [ceil(y-R), floor(y+R)]，与管子像素行有交集即视觉重叠，
-  //    所以"画面上重叠 ⇔ 判定撞"要求：
-  //      上管：y - R <= p.top + R
-  //      下管：y + R >= p.top + GAP - R - 1
-  //    —— 就是下面这两条。这是让"只画不判 / 只判不画"同时为 0 的唯一一组。
-  //
-  //    之前写成 `y - R <= p.top || y + R >= p.top + GAP`（把 p.top 当像素用），
-  //    以及 `y - R < p.top || y + R > p.top + GAP`，两个方向各差了一段 R
-  //    （实测"只画不判"35~37 个 y），表现就是用户报的【撞上了却不判失败】。
-  //
-  // demo/verify_collision_pixels.js 用**逐像素**对账守着（不做几何换算）：
-  // 5 个 top 值下"只画不判"与"只判不画"都必须为 0。
-  if (G.y + BIRD_R >= G.H - 14) return die('撞到地面');
-  if (G.y - BIRD_R <= 0) return die('撞到天花板');
-  for (const p of G.pipes) {
-    const cx = Math.max(p.x, Math.min(G.birdX, p.x + PIPE_W));   // 矩形上最近的 x
-    if ((G.birdX - cx) ** 2 > BIRD_R ** 2) continue;             // 水平还没够到
-    if (G.y - BIRD_R <= p.top + BIRD_R
-        || G.y + BIRD_R >= p.top + GAP - BIRD_R - 1) return die('撞上管子');
-  }
-}
-function die(cause) { if (!G.dead) { G.dead = true; G.cause = cause; G.deadT = 0; } }
 
 // ============================================================ 经典 FlappyBird 画面
 const GROUND = 92;                       // 地面高度（像素）
@@ -764,31 +613,39 @@ function initUI() {
     el.addEventListener('change', async () => {
       $('stat').textContent = '正在重建脑（' + el.value + '）…';
       const r = await post('/api/config', { graph: el.value });
-      // 换干预 = 换被试：计分必须清零，否则看不出是干预造成的差别
-      G.score = 0; G.best = 0; resetGame();
+      // 换干预 = 换被试：计分必须清零，否则看不出是干预造成的差别。
+      // ⚠️ 重置世界也必须在**服务端**做（前端只清显示值没用）。
+      G.score = 0; G.best = 0;
+      post('/api/game/reset', {});
       $('stat').textContent = r.error ? '失败：' + r.error
         : '干预 = ' + el.value + (el.value === 'real' ? '（正常反射）' : '（对照）');
     });
   });
-  $('btn-reset').addEventListener('click', () => { post('/api/reset', {}); resetGame(); });
-  // 手动拍翅：让人亲自试一下这个游戏有多难，体感比看数字直观
+  $('btn-reset').addEventListener('click', () => {
+    // 重开由**服务端**做（世界与脑都归零），前端不再自己 resetGame
+    post('/api/game/reset', {}).then(() => { S.pendingReset = true; });
+  });
+  // 手动拍翅：让人亲自试一下这个游戏有多难，体感比看数字直观。
+  // ⚠️ 现在是**服务端权威**：拍翅必须让服务端执行，前端自己改 G.vy 会被下一次
+  //    状态同步直接覆盖掉（这一点是"改前端"和"改服务端"最容易踩的坑）。
   const manual = () => {
     if (G.dead) return;
-    // 手动接管：直接结束加速期并给一次拍翅
-    G.warmupT = WARMUP_S; G.vy = FLAP_V; G.manual = true;
+    post('/api/game/flap', {});
   };
   addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); manual(); } });
   $('game').addEventListener('pointerdown', manual);
 }
 
 // ---------------------------------------------------------------- 主循环
-// ⚠️ 排障计数器**必须**在这里初始化。
+// 排障计数器**必须**在这里显式初始化。
 // 踩过：`DBG.brainTicks++` 在 DBG 没有该字段时是 `undefined++` = **NaN**，
 // 而诊断脚本写的是 `d.brainTicks || 0`，NaN 就被显示成 0 —— 于是看起来像
 // "脑一个 tick 都没推进"，我照着这个假象查了很久的时序和服务器队列问题。
-const DBG = { frames: 0, brainTicks: 0, physSteps: 0, err: null, lastTs: null,
-              // 诊断：统计物理步/脑 tick 的真实比值，以及驱动被复用了几步
-              sbOk: 0, sbBusy: 0, pendMax: 0, G, P, S };
+//
+// 注：`brainTicks / physSteps / sbOk / pendMax` 这些是**前端自己跑仿真**时期
+// 的计数器。现在仿真在服务端，它们没有意义了，已删掉 —— 免得又拿一个恒为 0
+// 的数去判断"是不是没在跑"。要看真实速率请读 `G.srvStats`（来自服务端）。
+const DBG = { frames: 0, err: null, lastTs: null, G, P, S };
 window.__dbg = DBG;                 // 排障用：控制台读 __dbg.frames / __dbg.err
 window.G = G;                       // 排障用：控制台看当前分数 / 死因
 const PERF = { f: 0, last: 0, fps: 0 };
@@ -806,23 +663,16 @@ function loop(ts) {
     const dt = G.last ? Math.min(0.05, now - G.last) : 0;
     G.last = now;
 
-    // ---- 物理已经在 `driveLoop()` 里推进了（脑响应驱动，不受帧率限制）。
-    //      这里**只负责显示**最新状态 —— 两边彻底解耦，见 driveLoop 的长注释。
-    //
-    //      历史（我在这里错过好几轮，把结论留下）：
-    //        ❌ 物理跟墙钟走（G.acc += dt，要 50 步/秒）+ pend 每帧只消化 1 步
-    //           → 帧率低于 50fps 就崩：pend 涨到上限 64、决策积压几十步
-    //        ❌ 物理跟帧率走（每帧 1 步）
-    //           → 与脑严格 1:1 了，但帧率 11.5fps 就只有 5.8 步/秒（12% 速度）
-    //              鸟慢到飞不起来
-    //        ✅ 物理跟**脑响应**走（当前）
-    //           → 服务端仿真 1.73ms/tick，13.4ms 的往返几乎全是 HTTP 开销，
-    //             所以控制回路能跑到 40~75 步/秒，**与渲染帧率无关**
-    if (!driving) driveLoop();
-    // 死亡后的重开计时：必须用**帧时钟**。
-    // 物理在 G.dead 时不推进（driveLoop 停手），所以 deadT 不能靠物理累加 ——
-    // 否则撞死后永远重不开（实测卡死：150 秒 0 分、dead=1）。
-    if (G.dead) { G.deadT += dt; if (G.deadT > 1.6) resetGame(); }
+    // ---- 前端**不跑仿真**。这里做两件事：
+    //      ① 按自己的帧率去服务端**取状态**（单飞，不堆积请求）
+    //      ② 在两次状态之间**插值**，所以画面是 60fps 流畅的
+    //      游戏速度完全由服务端的固定 50 Hz 决定，与渲染帧率、与网络都无关。
+    //      （前端四种驱动方式的失败史见文件上方 applyServerState 的注释。）
+    pollGame();
+    interpolate();
+    // 死亡后的重开由**服务端**负责（撞了停 1.6s 再重开，见 server.py 的 _game_loop）。
+    // 前端只跟着显示，不再自己计时重开。
+    if (G.dead) G.deadT = 0;                  // 本地不再累加（避免旧逻辑误触发 reset）
     // 排障遥测：每 ~0.5s 记一行
     if (PERF && (ts - (DBG.telTs || 0)) > 500) {
       DBG.telTs = ts;
@@ -875,7 +725,10 @@ async function boot() {
       `<br><b>Flappy = 双向逼近反射</b>：` +
       `腹侧/背侧半视野 + 接近速度门控（死区 ${FLAPPY.gapMargin}px）· ` +
       `关卡按执行器带宽生成（向上跳变 ≤ ${FLAPPY.maxClimb}px）`;
-    init3D(); initUI(); resetGame();
+    init3D(); initUI();
+    // 游戏世界由服务端持有（进页面时它已经在跑了），前端直接开始取状态即可。
+    // 先同步取一次，避免头几帧没有 srvStats 而画不出东西。
+    await pollGame();
     requestAnimationFrame(loop);
   } catch (e) {
     // 之前这里静默失败，页面永远停在"载入中"

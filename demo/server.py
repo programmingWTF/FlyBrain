@@ -106,6 +106,14 @@ def find_vendor() -> pathlib.Path | None:
 from fpv import looming                              # noqa: E402
 from fpv.spiking_brain import SpikingBrain           # noqa: E402
 
+#: 两次拍翅的最小间隔（秒）—— 与 demo/app.js 的 FLAP_COOLDOWN 一致。
+#: 服务端自持回路由 GameWorld 自己管这个门；评测台那边由 Harness 统一管。
+FLAP_COOLDOWN = 0.14
+#: 服务端仿真速率（Hz）。**固定 50**（= 1/20ms，评测台的"真实时间"）。
+#: 这是整个重构的目的：脑与物理在同一个进程里按这个节拍 1:1 锁步，
+#: HTTP 只用来取状态，所以游戏速度与网络、与浏览器定时器都无关。
+SIM_HZ = 50.0
+
 GAIN, TONIC = 3.0, 0.0            # 带载标定过的工作点
 # ---- 游戏几何（必须与 demo/app.js 的常数一致；双向投射要用）----
 G_H = 620.0                       # 画布高
@@ -263,6 +271,180 @@ def build_all_coords(brain) -> np.ndarray:
     return arr
 
 
+class GameWorld:
+    """Flappy 的游戏物理与关卡生成 —— **服务端权威**版本。
+
+    为什么要在服务端再写一遍（而不是继续用前端的 `demo/app.js`）
+    ------------------------------------------------------------
+    前端那版跑不出恒定速度，根因是结构性的：**游戏时钟必须挂在某个外部节奏上**，
+    而浏览器里可选的只有两个，实测都不行：
+
+        setTimeout(4)          → 29.8 次/s（被浏览器压到 ~33ms）
+        requestAnimationFrame  → 28.2 次/s
+
+    更糟的是 HTTP 往返中位 60ms、p90 86ms、最快 4ms（差十几倍），
+    于是"这一步物理该配多少时间"时多时少 → 表现就是"时快时慢"。
+    试过的补救（固定节拍+队列预取、大批量预取、预取与消费拆分）都不稳，
+    因为**只要决策要靠一次跨进程往返拿到，时钟就一定是抖的**。
+
+    放到服务端之后：脑与物理在**同一个进程、同一个锁**里按 1:1 跑固定 50 Hz，
+    没有任何网络或定时器节拍进入游戏时钟。HTTP 只用来**取状态**，
+    取晚了只会让画面晚一点，不会改变游戏速度。
+
+    物理与碰撞判据与 `demo/app.js`、`scripts/flappy_bench.py` **逐字一致**
+    （`demo/verify_server_collision.js` 逐像素守着「服务端判定 vs 前端画法」；
+    `scripts/verify_server_physics.py` 守着这里与评测台逐 tick 等价）。
+    """
+
+    #: 与 app.js / flappy_bench 一致的常数（改这里必须同时改那两处）
+    G_W, G_H = 520, 620
+    BIRD_X = 120
+    BIRD_R = 17
+    GROUND = 92
+    GAP = 184
+    PIPE_W = 62
+    PX_PER_M = 240.0
+    SPACING = 300.0
+    GRAV = 1180.0
+    FLAP_V = -340.0
+    TICK_S = 0.02
+    WARM_S = 0.8
+
+    def __init__(self, *, max_climb: float = 40.0, first_gap_extra: float = 160.0,
+                 seed: int | None = None):
+        self.max_climb = float(max_climb)
+        self.first_gap_extra = float(first_gap_extra)
+        self.rng = np.random.default_rng(seed)
+        self.reset()
+
+    def reset(self) -> None:
+        self.y = 300.0
+        self.vy = 0.0
+        self.t = 0.0
+        self.pipes: list[dict] = []
+        self.score = 0
+        self.best = getattr(self, "best", 0)
+        self.dead = False
+        self.cause = ""
+        self.spawned = 0
+        self.cooldown = 0.0
+        self.flap_t = 0.0                      # 最近一次拍翅的游戏时刻（给前端画翅膀）
+        # 开局那根：与 app.js 一致 —— top=250，位置 birdX + 0.75m - pipeW
+        self.pipes.append(dict(x=self.BIRD_X + 0.75 * self.PX_PER_M - self.PIPE_W,
+                               top=250.0, passed=False))
+        self.spawned += 1
+
+    # ---------------------------------------------------------------- 关卡生成
+    def spacing(self) -> float:
+        """本根之后那根的间距。第 2 根用 first_gap_extra 拉长（与 bench 一致）。"""
+        if self.first_gap_extra > 0 and self.spawned == 1:
+            return self.SPACING + self.first_gap_extra
+        return self.SPACING
+
+    def _spawn(self, top: float) -> None:
+        self.pipes.append(dict(x=self.G_W + 30.0, top=float(top), passed=False))
+        self.spawned += 1
+
+    def _next_gap_top(self) -> float:
+        """相邻缺口的**向上**跳变限在 max_climb 以内（向下不设限）。
+
+        这不是降低难度，而是排除物理上不可达的关卡：鸟的可持续爬升率约 100 px/s，
+        管距 300px/240px·s⁻¹ = 1.25 s，一个间隔最多爬约 125px；而 `70 + rand*330`
+        的缺口跳变有 330px 量程 —— 超出的关卡怎么飞都进不去。见 ESCAPE.md §6。
+        """
+        lo = 70.0
+        hi = self.G_H - self.GAP - 150.0                     # = 286
+        if not self.pipes:
+            return float(self.rng.uniform(lo, hi))
+        prev_c = self.pipes[-1]["top"] + self.GAP / 2.0
+        top_max = min(hi, prev_c + self.max_climb - self.GAP / 2.0)
+        if top_max < lo:
+            top_max = lo
+        return float(self.rng.uniform(lo, top_max))
+
+    # ---------------------------------------------------------------- 几何查询
+    def nearest_pipe(self):
+        best = None
+        for p in self.pipes:
+            if p["x"] + self.PIPE_W > self.BIRD_X - 6 and (best is None or p["x"] < best["x"]):
+                best = p
+        return best
+
+    def gap_center(self) -> float:
+        p = self.nearest_pipe()
+        return (p["top"] + self.GAP / 2.0) if p else (self.G_H / 2.0)
+
+    # ---------------------------------------------------------------- 物理
+    def step(self, flap: bool) -> None:
+        """推进恰好一个 tick。`flap` 是**已经过冷却门**的最终决策。
+
+        ⚠️ 这个函数必须与 `scripts/flappy_bench.py` 的 `World.step` **逐字等价**：
+        它只做物理，**不管冷却**。原因是评测台那边冷却由 harness 统一管，
+        `World.step(flap)` 收到什么就无条件执行什么。
+        我最初把冷却塞进这里，结果 `scripts/verify_server_physics.py` 立刻抓到：
+        评测台 `vy=-316.4`（= -340 + 1180×0.02），服务端 `-292.8`（拍翅被吞）。
+        所以冷却门移到调用方（`Session._game_tick`），两边形状就一致了。
+        """
+        dt = self.TICK_S
+        if self.dead:
+            return
+        self.t += dt
+        if flap:
+            self.vy = self.FLAP_V
+            self.flap_t = self.t
+        self.vy += self.GRAV * dt
+        self.y += self.vy * dt
+        warm = self.t < self.WARM_S
+        for p in self.pipes:
+            p["x"] -= self.PX_PER_M * dt
+            if not p["passed"] and p["x"] + self.PIPE_W < self.BIRD_X:
+                p["passed"] = True
+                self.score += 1
+                self.best = max(self.best, self.score)
+        self.pipes = [p for p in self.pipes if p["x"] > -self.PIPE_W - 10]
+        last = self.pipes[-1] if self.pipes else None
+        if last is None or last["x"] < self.G_W - self.spacing():
+            self._spawn(self._next_gap_top())
+        if warm:
+            # 加速期只限制在画面内，不判碰撞（与 app.js 的 warm 分支逐字对应）
+            self.y = min(max(self.y, 40.0), float(self.G_H - self.GROUND - self.BIRD_R - 1))
+            return
+        # ---- 碰撞：像素级判据，与 app.js / flappy_bench / DQN 一致
+        if self.y + self.BIRD_R >= self.G_H - 14:
+            return self.die("撞到地面")
+        if self.y - self.BIRD_R <= 0:
+            return self.die("撞到天花板")
+        for p in self.pipes:
+            cx = max(p["x"], min(self.BIRD_X, p["x"] + self.PIPE_W))
+            if (self.BIRD_X - cx) ** 2 > self.BIRD_R ** 2:
+                continue
+            if (self.y - self.BIRD_R <= p["top"] + self.BIRD_R
+                    or self.y + self.BIRD_R >= p["top"] + self.GAP - self.BIRD_R - 1):
+                return self.die("撞上管子")
+
+    def die(self, cause: str) -> None:
+        self.dead = True
+        self.cause = cause
+
+    def snapshot(self, **extra) -> dict:
+        """给前端的状态快照。刻意做小（前端每帧都要取）。"""
+        d = {
+            "t": round(self.t, 4),
+            "y": round(self.y, 2),
+            "vy": round(self.vy, 2),
+            "score": self.score,
+            "best": self.best,
+            "dead": self.dead,
+            "cause": self.cause,
+            "flap_t": round(self.flap_t, 4),
+            # 只报可见的管子（画面外的不必发）
+            "pipes": [[round(p["x"], 2), round(p["top"], 2)]
+                      for p in self.pipes if p["x"] > -self.PIPE_W - 4],
+        }
+        d.update(extra)
+        return d
+
+
 class Session:
     """一个持锁的活脑会话。"""
 
@@ -296,6 +478,134 @@ class Session:
         self._wmap_cache: dict = {}
         self.last_plan: dict = {}
         self.reset()
+        # ---- 服务端锁步仿真（见 GameWorld 的说明）
+        self.game = GameWorld(max_climb=MAX_CLIMB, first_gap_extra=FIRST_GAP_EXTRA)
+        self.game_lock = threading.Lock()
+        self.game_stats = dict(ticks=0, flaps=0, rate=0.0, dead=0, restarts=0)
+        self._stop = False
+        self._thread = threading.Thread(target=self._game_loop, daemon=True,
+                                        name="flappy-sim")
+        self._thread.start()
+
+    # ------------------------------------------------------------ 服务端锁步仿真
+    def _game_tick(self) -> None:
+        """推进**恰好一个 tick**：按当前世界算驱动 → 走一个脑 tick → 用 DNp01
+        的发放决定拍不拍 → 走一步物理。
+
+        这就是与 `scripts/flappy_bench.py` **同构**的控制回路，也是整个重构的要点：
+        决策与物理步严格 1:1 配对（先算驱动、再问脑、再用这个决策走物理），
+        而且全程在**同一个进程、同一个锁**里 —— 没有任何网络往返进入时钟。
+        """
+        w = self.game
+        gap_c = w.gap_center()
+        body = dict(BIDI)                       # 与前端同一套默认参数（从 /api/info 读同一份）
+        body.update(y=w.y, vy=w.vy, gap=gap_c, ground_y=GROUND_Y)
+        idx, pv, _eff = self._bidi_plan(body)
+        clamp = (torch.cat(idx), torch.cat(pv)) if idx else None
+        self.brain.step(clamp=clamp)
+        dn = int(self.brain.S[self.g["DNp01"]].sum())
+        self.dn_tick.append(dn)
+        flap = sum(self.dn_tick) >= 1
+        # 手动接管（空格/点击）：人在场时优先于人，否则玩了半天没反应
+        if getattr(self, "_manual_flap", False):
+            self._manual_flap = False
+            flap = True
+        # ---- 冷却门：与 demo/app.js 的 `if (flap && G.cooldown <= 0)` 同构 ——
+        #      冷却期内这一拍**什么都不做**（不是把 vy 改成别的值）。
+        #      它必须在**这里**而不是 GameWorld 里：GameWorld 要与评测台的
+        #      `World.step(flap)` 逐字等价（那个是无条件的），见 GameWorld.step 的注释。
+        w.cooldown = max(0.0, w.cooldown - 0.02)
+        if flap and w.cooldown > 0:
+            flap = False
+        elif flap:
+            w.cooldown = FLAP_COOLDOWN
+        if flap:
+            self.game_stats["flaps"] += 1
+        w.step(flap)
+        self.game_stats["ticks"] += 1
+
+    def _game_loop(self) -> None:
+        """固定 50 Hz 的仿真线程。
+
+        用**墙钟差值**决定这一轮走几个 tick（而不是"每次醒过来走一步"），
+        所以即使这个线程被系统调度得忽快忽慢，游戏速度依然恒定 ——
+        这是与前端那版最大的区别：前端没有任何一个可信的墙钟节拍可用
+        （setTimeout 被压到 ~30 次/s、rAF 在后台会被完全暂停）。
+        """
+        step_s = 1.0 / SIM_HZ
+        last = time.perf_counter()
+        carry = 0.0
+        rate_t0, rate_n = last, 0
+        while not self._stop:
+            now = time.perf_counter()
+            dt = now - last
+            last = now
+            if dt > 0.5:
+                dt = 0.5                            # 挂起/暂停后不要一次补太多
+            carry += dt
+            n = 0
+            with self.game_lock:
+                while carry >= step_s and n < 12:   # 上限防螺旋
+                    if self.game.dead:
+                        # 撞了：停一小会儿再重开，让玩家看见"撞了"
+                        break
+                    self._game_tick()
+                    carry -= step_s
+                    n += 1
+                    rate_n += 1
+                if self.game.dead:
+                    if not hasattr(self, "_dead_since"):
+                        self._dead_since = now
+                    elif now - self._dead_since > 1.6:
+                        self.game.reset()
+                        self.reset()                # 脑也归零，下一局从零开始
+                        self.game_stats["restarts"] += 1
+                        del self._dead_since
+                        carry = 0.0
+            if now - rate_t0 >= 1.0:
+                self.game_stats["rate"] = round(rate_n / (now - rate_t0), 1)
+                self.game_stats["dead"] = 1 if self.game.dead else 0
+                rate_t0, rate_n = now, 0
+            # 睡到下一个节拍（留一点余量，避免忙等）
+            slack = step_s - (time.perf_counter() - now)
+            time.sleep(slack if slack > 0.0005 else 0.0005)
+
+    def game_snapshot(self) -> dict:
+        """前端每帧取的状态快照。刻意做小。"""
+        with self.game_lock:
+            st = dict(self.game_stats)
+            snap = self.game.snapshot(**st)
+            snap["sim_hz"] = SIM_HZ
+            snap["need"] = 1
+            # 最近一次脑读出的几个数（前端画曲线用）
+            snap["dn01_recent"] = int(sum(self.dn_tick)) if self.dn_tick else 0
+            snap["plan"] = dict(self.last_plan)
+            # ---- 3D 脑图要点亮的细胞。
+            # ⚠️ 这几个量原来由**前端自己的脑循环**从 /api/step 的响应里拿。
+            #    改成服务端权威之后那条路没了，脑图会**静默变空**（不报错，
+            #    很容易被当成"面板就这样"）。所以在这里补回来。
+            S = self.brain.S
+            snap["viz_spike"] = [int(i) for i in self.viz_idx[S[self.viz_idx].bool()].tolist()]
+            lit = self.lit_assets[S[self.lit_assets].bool()]
+            snap["lit_spike"] = [int(i) for i in lit.tolist()]
+            # need 是**膜电位阈值**（不是 need_spikes 那个计数）—— 前端用它算
+            # "到达阈值的比例"来画驱动条，两处口径必须一致
+            snap["need"] = round((1 - self.base.leak) * self.base.threshold
+                                 / self.base.gain, 5)
+            # eff：本 tick 从 DNp01 读出的驱动量（与 /api/step 同口径）
+            snap["eff"] = round(
+                (1 - self.base.leak) * float(self.base.threshold)
+                * float(self.brain.S[self.g["DNp01"]].float().sum())
+                / max(self.base.gain, 1e-9), 5)
+            return snap
+
+    def game_reset(self) -> None:
+        with self.game_lock:
+            self.game.reset()
+            self.reset()
+            self.game_stats["restarts"] += 1
+            if hasattr(self, "_dead_since"):
+                del self._dead_since
 
     def _build_lit(self):
         """给前端用的『可点亮神经元』清单：资产索引 + 类型 + 侧别 + 解剖坐标。"""
@@ -694,6 +1004,9 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/info"):
             return self._json(self.sess.info())
+        # ---- 服务端权威游戏状态：前端每帧取这个来渲染（见 GameWorld 的说明）
+        if self.path.startswith("/api/game/state"):
+            return self._json(self.sess.game_snapshot())
         if self.path.startswith("/api/coords.bin"):
             data = self.sess.coords.tobytes(order="C")
             self.send_response(200)
@@ -714,6 +1027,16 @@ class H(BaseHTTPRequestHandler):
         try:
             if self.path.startswith("/api/step"):
                 return self._json(self.sess.step(req))
+            # 重开一局（前端"再来一局"按钮）
+            if self.path.startswith("/api/game/reset"):
+                self.sess.game_reset()
+                return self._json({"ok": True})
+            # 手动拍翅：**必须由服务端执行**。前端自己改 vy 会被下一次状态同步覆盖 ——
+            # 这是"服务端权威"下最容易踩的坑。
+            if self.path.startswith("/api/game/flap"):
+                with self.sess.game_lock:
+                    self.sess._manual_flap = True
+                return self._json({"ok": True})
             if self.path.startswith("/api/config"):
                 if "graph" in req:
                     self.sess.set_graph(req["graph"])

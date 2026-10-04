@@ -245,7 +245,7 @@ class World:
             # 与 demo/app.js 的 physics() 逐字一致（像素级判据，见那边的长注释）：
             #   上管覆盖像素 [0, top+R]、下管覆盖像素 [top+GAP-R-1, ...]，
             #   鸟圆周覆盖像素 [ceil(y-R), floor(y+R)]，有交集即撞 —— 化简后就是这两条。
-            #   demo/verify_collision_pixels.js 用逐像素对账守着（只画不判/只判不画必须为 0）。
+            #   demo/verify_server_collision.js 用逐像素对账守着（只画不判/只判不画必须为 0）。
             if (self.y - BIRD_R <= p["top"] + BIRD_R
                     or self.y + BIRD_R >= p["top"] + GAP - BIRD_R - 1):
                 return self.die("撞上管子")

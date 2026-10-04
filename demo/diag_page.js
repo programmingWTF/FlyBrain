@@ -99,23 +99,20 @@ async function getWsUrl() {
   console.log('  canvas game   :', await evalJs('(function(){var c=document.getElementById("game");return c?c.width+"x"+c.height:"无"})()'));
   console.log('  canvas brain  :', await evalJs('(function(){var c=document.getElementById("brain");return c?c.width+"x"+c.height:"无"})()'));
 
-  // 脑 tick 数 vs 物理帧：错配修好后两者应当 1:1（评测台就是严格 1:1）。
-  // ⚠️ 口径：这里是 **Δframes : ΔbrainTicks**，不是反过来。
-  //    <1 表示脑比物理慢（页面整体变慢）；>1 表示物理跑在脑前面（鸟偏重，是之前那个 bug）。
-  const t1 = await evalJs('window.__dbg && window.__dbg.brainTicks');
+  // 服务端仿真速率（tick/s）。仿真已搬到服务端（见 server.py 的 GameWorld），
+  // 前端**不再自己跑物理**，所以这里读的是服务端 ticks 的增量。
+  // 目标：恒定 50.0（= 评测台的真实时间）。低了说明服务端线程被抢或机器繁忙。
+  const t1 = await evalJs('((window.__dbg||{}).G||{}).srvStats && __dbg.G.srvStats.ticks');
   const f1 = await evalJs('window.__dbg && window.__dbg.frames');
   await sleep(8000);
-  const t2 = await evalJs('window.__dbg && window.__dbg.brainTicks');
+  const t2 = await evalJs('((window.__dbg||{}).G||{}).srvStats && __dbg.G.srvStats.ticks');
   const f2 = await evalJs('window.__dbg && window.__dbg.frames');
   const dt = (t2 - t1) || 0, df = (f2 - f1) || 0;
-  console.log('  brainTicks    :', t1, '->', t2, `  (Δ${dt})`);
-  console.log('  frames        :', f1, '->', f2, `  (Δ${df})`);
+  console.log('  服务端 ticks  :', t1, '->', t2, `  (\u0394${dt})`);
+  console.log('  渲染 frames   :', f1, '->', f2, `  (\u0394${df})`);
   if (dt > 0) {
-    const brainHz = dt / 8;                 // 实测脑速率（tick/秒）
-    console.log(`  脑速率        : ${brainHz.toFixed(1)} tick/s  (dt=20ms 应为 50；`
-      + `低了就是页面整体变慢)`);
-    console.log(`  帧 : 脑tick   : ${(df / dt).toFixed(2)} : 1  `
-      + `(1.00 = 物理与脑严格同步；<1 = 脑跟不上、游戏变慢)`);
+    console.log(`  服务端仿真    : ${(dt / 8).toFixed(2)} 步/秒   (目标恒定 50.0)`);
+    console.log(`  渲染帧率      : ${(df / 8).toFixed(1)} fps   (与游戏速度无关)`);
   }
   console.log('  当前分数      :', await evalJs('(window.G && G.score) ?? "?"'),
               ' 死因:', await evalJs('(window.G && G.cause) || "无"'));

@@ -1,16 +1,25 @@
 @echo off
 rem ============================================================
-rem  One-shot health check for the FlyBrain demo.
+rem  One-shot health check for the FlyBrain Flappy demo.
 rem
 rem  Covers the things that actually broke before:
 rem   1. js syntax        -- a stray */ in a doc comment silently killed the
 rem                          whole module; the page then sat on its initial
 rem                          text and looked like "the server is down".
-rem   2. pipe drawing     -- drawn pipe must match the collision test pixel
-rem                          for pixel (verify_pipe_visual.js).
-rem   3. real browser     -- boots the page headlessly, reports console errors
-rem                          and final page state (diag_page.js).
-rem   4. gameplay parity  -- page algorithm vs scripts/flappy_bench.py.
+rem                          WARNING: this does NOT catch calling a function
+rem                          that no longer exists (that cost me hours once) --
+rem                          only step 5 catches that.
+rem   2. physics parity   -- the server's GameWorld must be tick-for-tick
+rem                          identical to the offline benchmark's World,
+rem                          otherwise "the score" means nothing.
+rem   3. collision pixels -- the server's collision test must match the pipes
+rem                          the browser DRAWS, pixel for pixel. The user
+rem                          reported "it looked like I hit the pipe but it
+rem                          did not count as a fail"; this is the guard.
+rem   4. shape invariants -- pipe drawing shape, bird outer radius.
+rem   5. real browser     -- boots the page headlessly, reports console errors,
+rem                          render fps, and whether the SERVER sim rate is a
+rem                          constant 50 steps/s (verify_page.js).
 rem
 rem  Requires the server to be running on port 8620 (run_demo.bat).
 rem  Note: ASCII only on purpose -- cmd.exe garbles UTF-8 Chinese.
@@ -20,27 +29,33 @@ cd /d "%~dp0.."
 set PY=D:\Code\FlyBrain\env\python.exe
 set FAIL=0
 
-echo [1/5] server on port 8620 ?
+echo [1/6] server on port 8620 ?
 netstat -ano | findstr /r /c:"TCP.*:8620 .*LISTENING" >nul 2>&1
 if %errorlevel%==0 (echo       up) else (
   echo       NOT running - start it with demo\run_demo.bat first
   set FAIL=1
 )
 
-echo [2/5] js syntax
+echo [2/6] js syntax
 node demo\check_syntax.mjs demo\app.js demo\verify_pipe_visual.js demo\diag_page.js
 if errorlevel 1 set FAIL=1
 
-echo [3/5] pipe drawing vs collision test
-node demo\verify_pipe_visual.js >nul 2>&1
-if errorlevel 1 (echo       MISMATCH - see demo\verify_pipe_visual.js output & set FAIL=1) else (echo       pixel-exact)
-
-echo [4/5] page boots in a real browser
-node demo\diag_page.js
+echo [3/6] server GameWorld vs benchmark World (tick-for-tick)
+"%PY%" scripts\verify_server_physics.py --games 12 --ticks 1200
 if errorlevel 1 set FAIL=1
 
-echo [5/5] gameplay parity (page algorithm vs benchmark)
-"%PY%" scripts\flappy_page_parity.py --games 20
+echo [4/6] server collision test vs drawn pipes (pixel-exact)
+node demo\verify_server_collision.js >nul 2>&1
+if errorlevel 1 (echo       MISMATCH - run demo\verify_server_collision.js and read the table & set FAIL=1) else (echo       pixel-exact)
+
+echo [5/6] shape invariants
+node demo\verify_pipe_visual.js >nul 2>&1
+if errorlevel 1 (echo       pipe shape invariant broken & set FAIL=1) else (echo       pipe ok)
+node demo\verify_bird_volume.js >nul 2>&1
+if errorlevel 1 (echo       bird volume mismatch & set FAIL=1) else (echo       bird ok)
+
+echo [6/6] page boots in a real browser + server rate is constant
+node demo\verify_page.js 24
 if errorlevel 1 set FAIL=1
 
 echo.

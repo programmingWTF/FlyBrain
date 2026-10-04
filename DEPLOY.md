@@ -168,15 +168,19 @@ location /flappy/ {
     proxy_http_version 1.1;
     proxy_set_header   Host $host;
     proxy_set_header   X-Real-IP $remote_addr;
-    proxy_read_timeout 300s;          # /api/step 偶尔会慢
+    proxy_read_timeout 300s;          # /api/step（离线式调用）偶尔会慢
 }
+
+**流式注意**：`/api/game/state` 是**短轮询**（前端每帧取一次，约 400 字节），
+不需要 WebSocket 或 SSE。如果反代开了响应缓冲，务必对 `/api/` 关掉
+（`proxy_buffering off`），否则状态会攒着一起发，画面会一顿一顿。
 ```
 
 两个必须注意的：
 
 1. **`--host 0.0.0.0` 时没有访问控制**，只在完全可信的内网这么干
-2. **一个脑 = 一份单线程状态**。多个人同时开页面会**共享同一个脑**、互相干扰
-   （连接是 `/api/step` 无状态调用，但 `Session` 是单例）。
+2. **一个脑 = 一份单线程状态**。多个人同时开页面会**共享同一个脑、同一个游戏**、
+   互相干扰（`Session` 是单例，游戏世界也是它持有的）。
    要真支持多人，得一人一个进程 + 端口，或者改造成按会话隔离
 
 ---
@@ -186,16 +190,29 @@ location /flappy/ {
 | 指标 | 实测 | 说明 |
 |---|---|---|
 | **启动时间** | **4.7 s** | 读 50 MB npz + 建 1470 万条边的索引。**只发生一次** |
-| **内存占用** | **483 MB** 工作集 | torch 张量 + torch 自身 |
-| **`/api/step` 延迟** | 中位 **27.0 ms**（6.6 ~ 34.7） | 单线程 CPU，一次 4 个 tick |
-| → 单线程吞吐 | 约 **37 req/s** | 而"1:1 实时"需要 50 req/s |
-| 脑/浏览器速度 | 浏览器是瓶颈 | 页面实测 14~20 tick/s，服务端并发能到 377 req/s |
+| **内存占用** | 约 **500 MB** 工作集 | torch 张量 + torch 自身 |
+| **仿真速率** | **恒定 50.0 步/秒** | 服务端锁步线程，20ms/tick 走墙钟；实测偏差 +0.1% |
+| **CPU 占用** | **持续约 1 个核** | 50 Hz 一直在跑脑 + 物理（闲置时也跑，页面随时打开都是活的） |
+| **`GET /api/game/state`** | 约 **400 字节** / 次 | 前端每帧取（渲染用） |
+| **`/api/step` 延迟** | 中位 **27.0 ms**（6.6 ~ 34.7） | 一次 4 个 tick；**页面已不再用它** |
 
 > 启动 4.7 s 这个数**依赖 `data/coords.npz`**。没有它而退回读 51.5 MB 的
 > `manifest.json` 时，光解析那个 JSON 就要几十秒 —— 预烤坐标就是为了消掉这一段。
 
-**已知的卡顿来源**：浏览器的 `/api/step` 往返速度跟不上，脑会落后于物理。
-这不是服务器的问题。详见 README 的"页面 vs 评测台：已定位的差距"。
+### 关于那个"持续占一个核"
+
+这是**刻意**的，不是泄漏：仿真线程按固定 50 Hz 自己往前走，
+不等任何请求。这样"打开页面立刻就是活的"，也彻底摆脱了
+"游戏速度取决于浏览器多快"这个结构性问题（详见 README 的
+"页面 vs 评测台：差距已消除"）。
+
+如果部署环境对 CPU 敏感，有三条路（都需要改代码，这里只记录方向）：
+
+1. 改成**按需驱动**：没人连页面时暂停线程，有 `/api/game/state` 请求时再恢复
+   （代价：切回页面时游戏是"停着的"，需要先补一段）。
+2. 把 `SIM_HZ` 降到 25（游戏变 0.5 倍速，但仍然是恒定的）。
+3. 用 `--device cuda`（如果机器有 GPU）—— 但要注意这个负载是稀疏传播，
+   GPU 不一定更快，得实测。
 
 ---
 
@@ -205,11 +222,14 @@ location /flappy/ {
 |---|---|---|
 | `FileNotFoundError: data/spiking_full.npz` | 资产没入库/没下全 | 确认 `data/` 里有 3 个大小非零的文件 |
 | **分数恒 0、脑不发放** | **用了默认资产 `spiking_circuit`**（不含 LC4/LPLC2） | 加 `--asset spiking_full` |
-| 右侧 3D 面板空白 | `coords.npz` 缺失或损坏 | 日志会有 `[提示] 没找到 ...` 字样；重新拉一次仓库 |
+| 右侧 3D 面板**空白但游戏照跑** | `coords.npz` 缺失或损坏 | 日志会有 `[提示] 没找到 ...` 字样；重新拉一次仓库 |
+| 3D 面板**不再闪烁/点不亮** | `/api/game/state` 没回 `viz_spike`/`lit_spike` | 这两个量必须由状态端点带上（前端自己那次 `/api/step` 已经没了）；照 README 的"两个坑"检查 |
+| 游戏**不前进**（画面定住） | 仿真线程挂了 | 看日志有没有异常；`curl /api/game/state` 看 `ticks` 是否在涨 |
+| 游戏**速度不对**（明显快/慢） | 主机负载过高导致线程被抢 | 正常是 50.0 步/秒；连续采样 `ticks` 的增量确认 |
 | 页面白屏、控制台 `Failed to resolve module specifier "three"` | `/vendor/three.module.js` 404 | 确认 `demo/vendor/three.module.js` 存在（1.3 MB） |
 | 首页 200 但所有 `/api/*` 404 | 端口被别的进程占了 | `ss -tlnp \| grep 8620`，杀掉或换端口 |
 | `Address already in use` | 已在跑 | `systemctl restart flyflappy` 或换端口 |
-| CPU 100% 一直不降 | 有人在跑 **离线评测台**（`scripts/flappy_bench.py`），不是 demo | demo 空闲时几乎不耗 CPU；查 `ps aux \| grep flappy_bench` |
+| CPU 100% 一直不降 | 可能是**离线评测台**在跑（`scripts/flappy_bench.py`） | demo 自己约占 1 个核；再多出来就查 `ps aux \| grep flappy_bench` |
 
 ---
 
@@ -257,7 +277,22 @@ curl -s -o /dev/null -w "%{http_code} %{size_download}\n" \
 # 5) 点云
 curl -s http://127.0.0.1:8620/api/coords.bin | wc -c  # 期望 1738044
 
-# 6) 脑真的在发放（这一步最能说明问题）
+# 6) 仿真在跑、而且速率恒定（**这是这次改动后最关键的验收**）
+#    目标：恒定 50.0 步/秒。隔 20 秒取两次，看 ticks 的增量。
+python3 - <<'PY'
+import json, time, urllib.request
+def st():
+    return json.loads(urllib.request.urlopen(
+        "http://127.0.0.1:8620/api/game/state", timeout=10).read())
+a = st(); time.sleep(20); b = st()
+rate = (b["ticks"] - a["ticks"]) / 20
+print(f"  仿真 {rate:.2f} 步/秒（目标 50）  score {a['score']}->{b['score']}  dead={b['dead']}")
+assert 45 <= rate <= 55, f"速率不对：{rate:.2f} 步/秒（应为 50 左右）"
+assert b["ticks"] > a["ticks"], "仿真线程没在推进！"
+print("  ✅ 恒定速率正常")
+PY
+
+# 7) 脑真的在发放（离线式调用，页面已经不用它了；这里只是确认脑活的）
 #    注意：请求体不能是空对象，必须给 ticks / need_spikes / drives
 curl -s -X POST http://127.0.0.1:8620/api/step \
   -H 'Content-Type: application/json' \
@@ -269,11 +304,13 @@ curl -s -X POST http://127.0.0.1:8620/api/step \
 # 返回里应该有 lc4_rate / dn01_recent / flap / lit_spike 等字段，且没有 error
 ```
 
-最后浏览器打开，确认三件事：
+最后浏览器打开，确认四件事：
 
 1. **状态栏**显示"冻结脑 144,837 神经元 / 15.02M 突触"
 2. **右侧 3D 脑图**有彩色点（LC4 橙、LPLC2 紫、DNp01 红）在闪
+   —— 如果**空白或全灰**，看排障表里"3D 面板不再闪烁"那一行
 3. **鸟会自己飞**（不是一直掉）—— 分数会慢慢涨
+4. **速度是稳的**：鸟和管子的移动不忽快忽慢（这正是搬到服务端要解决的问题）
 
 ---
 

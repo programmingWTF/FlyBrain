@@ -1,4 +1,4 @@
-// 校验管子的**形状不变量**（与判定无关的部分），避免与 verify_collision_pixels.js
+// 校验管子的**形状不变量**（与判定无关的部分），避免与 verify_server_collision.js
 // 的口径打架：
 //   1) 管子不越出 [x, x+PIPE_W]  —— 旧版在管体两侧各凸出 5px 画粗管口，那 10px
 //      "有画面、没判定"，而当时的校验器把比较范围裁在管宽内所以没抓到。
@@ -6,7 +6,7 @@
 //   3) 两根管子的外沿分别贴住画面顶与画面底。
 //
 // 竖直边界与判定的对账**不在这里** —— 那需要同时考虑鸟半径与像素闭区间，
-// 由 demo/verify_collision_pixels.js 逐像素负责（它读的是 app.js 里的真代码）。
+// 由 demo/verify_server_collision.js 逐像素负责（它读 server.py 的判据 + app.js 的画法）。
 //
 // 用法: node demo/verify_pipe_visual.js
 const fs = require('fs');
@@ -83,5 +83,5 @@ console.log('-'.repeat(80));
 console.log(bad === 0
   ? '✅ 管子不越出管宽、像素行连续、外沿分别贴住画面顶与底'
   : `❌ 有 ${bad} 个 top 值不满足形状不变量`);
-console.log('\n（竖直边界与判定的对账在 demo/verify_collision_pixels.js —— 逐像素、读真代码）');
+console.log('\n（竖直边界与判定的对账在 demo/verify_server_collision.js —— 逐像素、读真代码）');
 process.exit(bad === 0 ? 0 : 1);
