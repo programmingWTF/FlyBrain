@@ -37,14 +37,16 @@
 # 依赖（CPU 版 torch 就够）
 pip install numpy pandas torch --index-url https://download.pytorch.org/whl/cpu
 
-# 起服务（--asset 必须显式写 spiking_full，原因见下）
-OMP_NUM_THREADS=1 python demo/server.py --asset spiking_full --no-browser --port 8620
+# 起服务（默认资产就是 spiking_full，无需额外参数）
+OMP_NUM_THREADS=1 python demo/server.py --no-browser --port 8620
 # 浏览器打开 http://127.0.0.1:8620/
 ```
 
-⚠️ **`--asset` 不能省。** 默认值是 `spiking_circuit`，那个子图不含 LC4/LPLC2，
-而 Flappy 的所有感觉输入都打在这两个群上 —— 用默认值的后果是
-**脑完全不发放、分数恒为 0，而且不报错**。
+**`--asset` 默认已是 `spiking_full`**，正常不用传。
+这里曾经是个**静默失败陷阱**：默认到不含 LC4/LPLC2 的 `spiking_circuit` 子图时，
+脑完全不发放、**分数恒为 0，而且不报任何错** —— 很容易被当成"反射不行"。
+现在传了不含关键群的资产会在**启动时被直接拒绝**，并说清是哪一种问题
+（群缺失 / 预烤坐标索引越界）。
 
 Windows 下也可以直接双击 `demo/run_demo.bat`（关闭用 `demo/stop_demo.bat`）。
 **部署到 Linux 服务器请看 [`DEPLOY.md`](DEPLOY.md)**（systemd、验收清单、排障表）。
@@ -311,12 +313,14 @@ requestAnimationFrame    → 28.2 次/s   （后台还会被完全暂停）
 
 ```bash
 pip install numpy pandas torch --index-url https://download.pytorch.org/whl/cpu
-python demo/server.py --asset spiking_full --no-browser --port 8620
+python demo/server.py --no-browser --port 8620
 ```
 
-⚠️ **`--asset` 必须显式传 `spiking_full`**：默认值是 `spiking_circuit`，那个子图
-不含 LC4/LPLC2，而 Flappy 的所有感觉输入都打在这两个群上 ——
-用默认值的后果是**分数恒为 0，而且不报错**。
+**`--asset` 的默认值是 `spiking_full`**，正常不用管它。
+这个默认值原来是个**静默失败陷阱**：默认到 `spiking_circuit`（不含 LC4/LPLC2）
+的后果是**分数恒为 0、脑一次都不拍翅，而且不报任何错**。
+现在已经反过来 —— 传了不含关键群的资产会在**启动时被直接拒绝**，
+并且说清是哪一种问题（群缺失 / 预烤坐标索引越界）。
 
 本机实测：启动 **4.7 s**、内存约 **500 MB**、服务端仿真线程**持续占一个 CPU 核**
 （固定 50 Hz 跑脑 + 物理）；回退到 `< 5%` 占用。

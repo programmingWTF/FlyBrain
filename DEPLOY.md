@@ -49,7 +49,7 @@ pip install numpy pandas torch --index-url https://download.pytorch.org/whl/cpu
 
 ```bash
 cd flyflappy                      # 仓库根（本仓库就是 flyflappy 的内容）
-python demo/server.py --asset spiking_full --no-browser --port 8620
+python demo/server.py --no-browser --port 8620
 ```
 
 然后浏览器打开 `http://<服务器地址>:8620/`。
@@ -58,16 +58,20 @@ python demo/server.py --asset spiking_full --no-browser --port 8620
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--asset` | `spiking_circuit` | **要显式传 `spiking_full`** —— 见下面的坑 |
 | `--port` | `8620` | |
 | `--host` | `127.0.0.1` | **只监听本机**。要外部访问需要改成 `0.0.0.0`（见 §4） |
 | `--device` | `cpu` | |
 | `--no-browser` | — | 服务器上一定要加，否则它会去调 `xdg-open` |
+| `--asset` | `spiking_full` | **默认就是对的全脑资产**，正常不用传 |
 
-> ⚠️ **坑：默认资产是错的。**
-> `--asset` 的默认值是 `spiking_circuit`，但那个 8000 神经元的子图**不含 LC4/LPLC2**，
-> 而 Flappy 的所有感觉输入都打在 LC4/LPLC2 上 —— 用默认值的结果是脑完全不发放、
-> **分数恒为 0**，而且不报错。必须显式 `--asset spiking_full`。
+> ✅ **那个"默认资产是错的"的坑已经修掉了**（原来默认到 `spiking_circuit` 子图，
+> 不含 LC4/LPLC2 → 脑完全不发放、**分数恒为 0 且不报错**）。
+>
+> 现在两件事都做了：① 默认值改成 `spiking_full`；
+> ② 传了不含关键群的资产会在**启动时被直接拒绝**，并说清是哪一种问题
+> （群缺失 / 预烤坐标索引越界 —— 后者尤其阴：`data/coords.npz` 的 `key_*`
+> 是为全脑 144,837 个预烤的，换小资产时索引会整体越界，
+> 原本报的是一个跟根因毫无关系的 `IndexError`）。
 
 ### 启动成功的标志
 
@@ -135,7 +139,7 @@ journalctl -u flyflappy -f          # 看日志
 ### 临时前台跑（调试用）
 
 ```bash
-nohup python demo/server.py --asset spiking_full --no-browser --port 8620 \
+nohup python demo/server.py --no-browser --port 8620 \
       > flappy.log 2>&1 &
 tail -f flappy.log
 ```
@@ -221,7 +225,7 @@ location /flappy/ {
 | 现象 | 原因 | 解法 |
 |---|---|---|
 | `FileNotFoundError: data/spiking_full.npz` | 资产没入库/没下全 | 确认 `data/` 里有 3 个大小非零的文件 |
-| **分数恒 0、脑不发放** | **用了默认资产 `spiking_circuit`**（不含 LC4/LPLC2） | 加 `--asset spiking_full` |
+| **启动直接被拒绝**，提示"缺少关键群"或"预烤坐标索引越界" | 传了不含 LC4/LPLC2/DNp01 的资产 | 这是**故意的**（见 §3 的说明）。用 `--asset spiking_full` 或直接不传 |
 | 右侧 3D 面板**空白但游戏照跑** | `coords.npz` 缺失或损坏 | 日志会有 `[提示] 没找到 ...` 字样；重新拉一次仓库 |
 | 3D 面板**不再闪烁/点不亮** | `/api/game/state` 没回 `viz_spike`/`lit_spike` | 这两个量必须由状态端点带上（前端自己那次 `/api/step` 已经没了）；照 README 的"两个坑"检查 |
 | 游戏**不前进**（画面定住） | 仿真线程挂了 | 看日志有没有异常；`curl /api/game/state` 看 `ticks` 是否在涨 |
@@ -340,5 +344,5 @@ curl -s -X POST http://127.0.0.1:8620/api/step \
 python3 -V                                  # 必须 >= 3.10
 ls -la data/                                # 三个资产都在、大小非零
 .venv/bin/python -c "import numpy,pandas,torch; print('ok')"
-.venv/bin/python demo/server.py --asset spiking_full --no-browser --port 8620
+.venv/bin/python demo/server.py --no-browser --port 8620
 ```

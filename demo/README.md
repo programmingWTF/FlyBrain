@@ -9,16 +9,16 @@
 # 依赖（CPU 版 torch 就够）
 pip install numpy pandas torch --index-url https://download.pytorch.org/whl/cpu
 
-# 起服务
-python demo/server.py --asset spiking_full --no-browser --port 8620
+# 起服务（资产默认就是 spiking_full）
+python demo/server.py --no-browser --port 8620
 # 浏览器打开 http://127.0.0.1:8620/
 ```
 
 Windows 上也可以直接双击 `run_demo.bat`。
 
-> ⚠️ **`--asset` 必须显式写 `spiking_full`。** 默认值是 `spiking_circuit`，
-> 那个子图不含 LC4/LPLC2，而 Flappy 的所有感觉输入都打在这两个群上 ——
-> 用默认值的后果是**分数恒为 0，而且不报错**。
+> **`--asset` 默认已是 `spiking_full`。** 这里曾经是个静默失败陷阱（默认到
+> 不含 LC4/LPLC2 的子图 → 分数恒 0 且不报错），现在改成：传了不含关键群的
+> 资产就在**启动时被拒绝**并说明原因。
 
 零第三方前端依赖：只用 Python 标准库 `http.server` + 仓库自带的 three.js。
 不需要联网、不需要 GPU。

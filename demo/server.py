@@ -466,6 +466,33 @@ class Session:
             self.g = looming.resolve(self.base, looming.LOOM_SENSE
                                      + looming.ESCAPE_MOTOR + looming.CONTROL_SENSE
                                      + ["DNp02", "DNp11"])
+        # ---- 关键群自检：**必须在 _build_lit() 之前**。
+        # 两种都要查，缺一不可：
+        #   ① 群**不存在**（空数组）—— 例如不含 LC4 的子图
+        #   ② 群存在但**索引越界** —— 这个更阴：`data/coords.npz` 里的 `key_*`
+        #      数组是为**全脑 144,837 个神经元**预烤的。换成更小的资产
+        #      （`spiking_circuit` 只有 59,548 个）时这些索引会整体越界，
+        #      而 `len() != 0` 的检查**完全看不出来**。
+        #      于是报出一个跟根因毫无关系的错，把人往"坐标文件坏了"的方向带：
+        #          IndexError: index 61485 is out of bounds for axis 0 with size 59548
+        N = self.base.N
+        _missing = [nm for nm in ("LC4", "LPLC2", "DNp01") if len(self.g.get(nm, [])) == 0]
+        _oob = [nm for nm, v in self.g.items()
+                if len(v) and (int(v.min()) < 0 or int(v.max()) >= N)]
+        if _missing or _oob:
+            why = []
+            if _missing:
+                why.append("缺少关键群：" + "、".join(_missing))
+            if _oob:
+                why.append("预烤坐标里的索引越界（" + "、".join(_oob[:4]) + " …）："
+                           f"该资产只有 {N:,} 个神经元，"
+                           "而 data/coords.npz 是为全脑 144,837 个预烤的")
+            raise SystemExit(
+                f"\n❌ 资产 `{asset}` 不能用：\n   " + "\n   ".join(why) +
+                "\n\n   Flappy 的感觉输入全部打在 LC4/LPLC2 上，输出只读 DNp01。\n"
+                "   缺了它们分数会**恒为 0**，而且不会报错 —— 很容易被当成"
+                "「反射不行」。\n"
+                "   请用全脑资产：--asset spiking_full\n")
         rng = np.random.default_rng(0)
         self.viz_idx = torch.as_tensor(
             rng.choice(self.base.N, size=min(VIZ_SAMPLE, self.base.N), replace=False),
@@ -1051,7 +1078,13 @@ class H(BaseHTTPRequestHandler):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--asset", default="spiking_circuit")
+    # ⚠️ 默认值是 **spiking_full**，不是 spiking_circuit。
+    #    这个默认值曾经是个**静默失败陷阱**：spiking_circuit 子图不含 LC4/LPLC2，
+    #    而 Flappy 的所有感觉输入都打在这两个群上 —— 用它的后果是
+    #    **分数恒为 0、脑一次都不拍翅，而且不报任何错**。
+    #    现在只有 Flappy 一个模式了，没有理由再默认到那个子图。
+    ap.add_argument("--asset", default="spiking_full",
+                    help="脉冲脑资产。**必须含 LC4/LPLC2**，否则分数恒 0 且不报错")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--port", type=int, default=8620)
     ap.add_argument("--host", default="127.0.0.1")
@@ -1065,6 +1098,11 @@ def main() -> int:
           f"用时 {time.time()-t0:.1f}s")
     print("  " + "  ".join(f"{k}={v}" for k, v in sess.info()["groups"].items()))
     print(f"  可点亮神经元（有解剖坐标的）：{len(sess.lit)}")
+
+    # 关键群自检已经在 Session.__init__ 里做了（那里能给出更准的错误位置）。
+    g = sess.info()["groups"]
+    print(f"  ✅ 关键群齐全：LC4={g.get('LC4')} LPLC2={g.get('LPLC2')} "
+          f"DNp01={g.get('DNp01')}")
 
     H.sess = sess
 
