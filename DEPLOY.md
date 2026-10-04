@@ -3,6 +3,9 @@
 把 Flappy 那一页跑起来。**零第三方前端依赖**（three.js 随仓库自带），
 后端只要 `numpy` + `torch` + `pandas`。
 
+**本指南按 Linux 写**（`systemd` + POSIX 命令），代码本身已验证与平台无关，
+见 §9。
+
 ---
 
 ## 0. 这个仓库是自包含的（重要）
@@ -34,7 +37,9 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install numpy pandas torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-- **CPU 版 torch 就够**（本 demo 是单线程 CPU 推理，147 万突触的稀疏传播）
+- **需要 Python ≥ 3.10** —— 代码里用了 `pathlib.Path | None` 这种 PEP 604 注解
+  （`from __future__ import annotations` 已开，但 `|` 语法本身仍要 3.10+）
+- **CPU 版 torch 就够**（本 demo 是单线程 CPU 推理，1470 万突触的稀疏传播）
 - 版本要求很宽：`numpy>=1.24`、`pandas>=2.0`、`torch>=2.0`
 - 不需要 GPU、不需要 CUDA、不需要联网（前端资源都在仓库里）
 
@@ -253,9 +258,15 @@ curl -s -o /dev/null -w "%{http_code} %{size_download}\n" \
 curl -s http://127.0.0.1:8620/api/coords.bin | wc -c  # 期望 1738044
 
 # 6) 脑真的在发放（这一步最能说明问题）
+#    注意：请求体不能是空对象，必须给 ticks / need_spikes / drives
 curl -s -X POST http://127.0.0.1:8620/api/step \
-     -H 'Content-Type: application/json' -d '{}' | head -c 300
-# 返回里应该有 drive / lit_spike 等字段
+  -H 'Content-Type: application/json' \
+  -d '{"ticks":4,"need_spikes":1,
+       "drives":[{"type":"bidi","y":300,"vy":0,"gap":342,
+                  "gap_margin":18,"vy_gate":1,"ceil_boost":1,
+                  "dors_scale":0.35,"vent_gain":2.0,"vent_dev":120}],
+       "bidi":{"s50size":30,"n":3,"gain":1,"groups":["LC4","LPLC2"]}}'
+# 返回里应该有 lc4_rate / dn01_recent / flap / lit_spike 等字段，且没有 error
 ```
 
 最后浏览器打开，确认三件事：
@@ -263,3 +274,34 @@ curl -s -X POST http://127.0.0.1:8620/api/step \
 1. **状态栏**显示"冻结脑 144,837 神经元 / 15.02M 突触"
 2. **右侧 3D 脑图**有彩色点（LC4 橙、LPLC2 紫、DNp01 红）在闪
 3. **鸟会自己飞**（不是一直掉）—— 分数会慢慢涨
+
+---
+
+## 9. Linux 适用性（已逐项验证）
+
+这份指南按 Linux 写。代码里的平台相关问题都查过了：
+
+| 检查项 | 结果 |
+|---|---|
+| 可执行代码里的盘符路径（`D:\...`） | ✅ **没有**。项目里那些 `D:/Code/FlyBrain/env/python.exe` 全在 **docstring / 注释**里，只是示例，不影响运行 |
+| 路径拼接 | ✅ 全部用 `pathlib`，**没有** `os.path.join` / 反斜杠字符串 |
+| 顶层 import | ✅ 全是跨平台的：`os` / `argparse` / `json` / `pathlib` / `http.server` / `numpy` / `torch` |
+| 二进制资产 | ✅ `.gitattributes` 里显式标为 `binary`，不会被行尾转换破坏（这点在 Windows 上 `core.autocrlf=true` 时尤其重要，否则 Linux clone 下来才会炸） |
+| **打开浏览器** | ✅ **已修**。原来是 `subprocess.Popen(["cmd","/c","start","",url])` —— **Windows 专有**，在 Linux 上会抛 `FileNotFoundError`（被吞掉，表现为"浏览器静默不打开"）。现在改用标准库 `webbrowser.open()`，跨平台 |
+| torch 线程数 | 代码不设，靠环境变量。**Linux 上一定要 `OMP_NUM_THREADS=1`**：这个负载是稀疏传播，多开会更慢还抢 CPU |
+
+### Linux 上用不到的东西
+
+| 文件 | 说明 |
+|---|---|
+| `demo/*.bat`（`run_demo.bat` / `stop_demo.bat` / `check_all.bat`） | Windows 批处理，**Linux 忽略即可**，用本指南的命令代替 |
+| `demo/verify_*.js`、`demo/check_syntax.mjs` | 离线校验器，需要 Node.js。**部署不需要**，只在改代码时用 |
+
+### 服务器上第一次跑的自检顺序
+
+```bash
+python3 -V                                  # 必须 >= 3.10
+ls -la data/                                # 三个资产都在、大小非零
+.venv/bin/python -c "import numpy,pandas,torch; print('ok')"
+.venv/bin/python demo/server.py --asset spiking_full --no-browser --port 8620
+```

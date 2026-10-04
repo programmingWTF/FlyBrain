@@ -26,23 +26,29 @@
 
 ## 怎么跑
 
-**零第三方依赖**：只用 Python 标准库 `http.server` + 仓库自带的 three.js。
-不需要装包、不需要 GPU、不需要联网。
+**零第三方前端依赖**：只用 Python 标准库 `http.server` + 仓库自带的 three.js。
+后端需要 `numpy` / `pandas` / `torch`（CPU 版即可），**需要 Python ≥ 3.10**。
 
 ```bash
-cd flyflappy
+# 依赖（CPU 版 torch 就够）
+pip install numpy pandas torch --index-url https://download.pytorch.org/whl/cpu
 
-# 全脑资产（144,837 神经元 / 1502 万突触，载入慢一些，但这是完整脑）
-D:/Code/FlyBrain/env/python.exe demo/server.py --asset spiking_full
+# 起服务（--asset 必须显式写 spiking_full，原因见下）
+OMP_NUM_THREADS=1 python demo/server.py --asset spiking_full --no-browser --port 8620
 # 浏览器打开 http://127.0.0.1:8620/
 ```
 
+⚠️ **`--asset` 不能省。** 默认值是 `spiking_circuit`，那个子图不含 LC4/LPLC2，
+而 Flappy 的所有感觉输入都打在这两个群上 —— 用默认值的后果是
+**脑完全不发放、分数恒为 0，而且不报错**。
+
 Windows 下也可以直接双击 `demo/run_demo.bat`（关闭用 `demo/stop_demo.bat`）。
+**部署到 Linux 服务器请看 [`DEPLOY.md`](DEPLOY.md)**（systemd、验收清单、排障表）。
 
 ### 离线评测台（量分数、做消融）
 
 ```bash
-PY=D:/Code/FlyBrain/env/python.exe
+PY=python                                    # 或你的 venv 解释器
 
 # 双向逼近反射，60 局
 $PY scripts/flappy_bench.py --asset spiking_full --modes bidi --games 60 --max-ticks 5000

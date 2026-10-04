@@ -16,9 +16,10 @@
 ## 请按顺序做，每步都验证
 
 ### 1. 环境检查
-    确认：python3 --version（要 >= 3.10）
-    确认：磁盘至少有 1 GB 空余（仓库约 52 MB + 虚拟环境）
+    确认：python3 --version（**必须 >= 3.10**，代码用了 `X | None` 这种注解语法）
+    确认：磁盘至少有 1 GB 空余（仓库约 52 MB + 虚拟环境 + pip 缓存）
     确认：8620 端口没被占用（ss -tlnp | grep 8620）
+    确认：有 git（git --version）
 
 ### 2. 拉代码
     git clone https://github.com/programmingWTF/FlyBrain.git /opt/flyflappy

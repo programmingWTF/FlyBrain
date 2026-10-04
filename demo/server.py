@@ -34,7 +34,6 @@ import argparse
 import json
 import math
 import pathlib
-import subprocess
 import sys
 import threading
 import time
@@ -765,8 +764,13 @@ def main() -> int:
     url = f"http://{a.host}:{a.port}/"
     print(f"\n✓ 打开 {url}\n  （Ctrl+C 退出）\n")
     if not a.no_browser:
+        # 用标准库 webbrowser —— 跨平台。
+        # 原来写的是 `subprocess.Popen(["cmd", "/c", "start", "", url])`，那是
+        # **Windows 专有**的：在 Linux 上会抛 FileNotFoundError（被下面的 except 吞掉），
+        # 结果是"浏览器静默不打开"，很难察觉。服务器上仍然建议加 --no-browser。
         try:
-            subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
+            import webbrowser
+            webbrowser.open(url)
         except Exception:
             pass
     try:
