@@ -608,7 +608,10 @@ function draw3D() {
   T.grp.rotation.set(T.orbit.rx, T.orbit.ry, 0);
   T.camera.position.z = T.orbit.zoom;
   T._n = (T._n || 0) + 1;
-  if (T._n % 2 === 0) T.renderer.render(T.scene, T.camera);   // 3D 半速即可
+  // 这里**不再做半速**：限频已经由调用方（loop 里的 DRAW3D_MS = 30fps）负责。
+  // 原来这里还有一层 `T._n % 2`，两层叠加会让 3D 只剩 ~15fps（实测 707/1022 帧），
+  // 看起来像"脑图卡卡的"。限频只保留一处，免得以后又叠出第三层。
+  T.renderer.render(T.scene, T.camera);
 }
 
 // ---------------------------------------------------------------- HUD
@@ -693,6 +696,14 @@ const DBG = { frames: 0, err: null, lastTs: null, G, P, S };
 window.__dbg = DBG;                 // 排障用：控制台读 __dbg.frames / __dbg.err
 window.G = G;                       // 排障用：控制台看当前分数 / 死因
 const PERF = { f: 0, last: 0, fps: 0 };
+
+//: 取状态的间隔（毫秒）。服务端是 50 Hz，取 **20 Hz** 足够 ——
+//: 中间的帧由 `interpolate()` 补上。**不要设成 0（每帧都取）**：
+//: 60 req/s 会把单进程的服务端打爆（实测延迟从 3 ms 飙到 38.9 ms、页面卡死）。
+const POLL_MS = 50;
+//: 3D 脑图的绘制间隔（毫秒）。它有 13.9 万个点 + 每帧上传颜色缓冲，
+//: 是页面上最贵的一步，**限到 30fps** 就够看，省下的时间留给游戏画面。
+const DRAW3D_MS = 33;
 function loop(ts) {
   requestAnimationFrame(loop);
   DBG.frames++; DBG.lastTs = ts;
@@ -707,12 +718,22 @@ function loop(ts) {
     const dt = G.last ? Math.min(0.05, now - G.last) : 0;
     G.last = now;
 
-    // ---- 前端**不跑仿真**。这里做两件事：
-    //      ① 按自己的帧率去服务端**取状态**（单飞，不堆积请求）
-    //      ② 在两次状态之间**插值**，所以画面是 60fps 流畅的
+    // ---- 前端**不跑仿真**。这里做三件事：
+    //      ① **按固定频率**去服务端取状态（见下面的节流说明）
+    //      ② 在两次状态之间**插值**，画面才平滑
+    //      ③ 画游戏 + 画 3D 脑图
     //      游戏速度完全由服务端的固定 50 Hz 决定，与渲染帧率、与网络都无关。
-    //      （前端四种驱动方式的失败史见文件上方 applyServerState 的注释。）
-    pollGame();
+    //
+    // ⚠️ **`pollGame()` 必须节流，否则会把服务端打爆。**
+    //    原来这里无条件每帧调用一次 = 浏览器以 **60 req/s** 去砸 Python 的
+    //    `ThreadingHTTPServer`（单进程，还要跟一个 50 Hz 的仿真线程抢 GIL）。
+    //    实测后果：6 秒发出 **359 个**请求，`/api/game/state` 延迟从 ~3 ms
+    //    飙到 **38.9 ms**，页面卡顿、跳一下就停住、3D 面板几乎没机会更新。
+    //    服务端本身只有 50 Hz，取 20 Hz 完全够（插值补上中间的帧），请求量降到 1/3。
+    if (ts - (DBG.pollTs || 0) >= POLL_MS) {
+      DBG.pollTs = ts;
+      pollGame();
+    }
     interpolate();
     // 死亡后的重开由**服务端**负责（撞了停 1.6s 再重开，见 server.py 的 _game_loop）。
     // 前端只跟着显示，不再自己计时重开。
@@ -729,9 +750,13 @@ function loop(ts) {
       });
       if (DBG.tel.length > 120) DBG.tel.shift();
     }
-    // 物理步已经在上面按帧消化（G.pend），这里只负责画。
+    // 只负责画。
     drawGame(); drawScope();
-    if (P.show3d) draw3D();
+    // 3D 脑图单独限频（见 DRAW3D_MS 的说明）—— 它是页面上最贵的一步
+    if (P.show3d && ts - (DBG.d3Ts || 0) >= DRAW3D_MS) {
+      DBG.d3Ts = ts;
+      draw3D();
+    }
     hud();
   } catch (e) {
     DBG.err = (e && e.stack) ? e.stack : String(e);
