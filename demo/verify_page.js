@@ -98,6 +98,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     cv: (document.querySelector('#game')||{}).width||0,
     hold: document.querySelector('#stat') ? document.querySelector('#stat').textContent.slice(0,26) : '',
     err: (window.__dbg&&__dbg.err)||null,
+    errN: (window.__dbg&&__dbg.errN)||0,
+    d3: (window.__three&&__three._n)||0,
+    pts: (window.__three&&__three.geo&&__three.geo.attributes&&__three.geo.attributes.position)?__three.geo.attributes.position.count:0,
     vizN: ((window.__dbg&&__dbg.S&&__dbg.S.resp&&__dbg.S.resp.viz_spike)||[]).length,
     litN: ((window.__dbg&&__dbg.S&&__dbg.S.resp&&__dbg.S.resp.lit_spike)||[]).length,
     eff: (window.__dbg&&__dbg.S&&__dbg.S.resp&&__dbg.S.resp.eff)||0
@@ -113,7 +116,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     console.log(`  t=${String(t).padStart(3)}s  帧${String(s.frames).padStart(5)}  `
       + `分数${String(s.sc).padStart(3)}  y=${String(s.y).padStart(3)}  管${s.pipes}  `
       + `服务端${String(s.ticks).padStart(6)}t (${s.rate}/s)  画布${s.cv}  `
-      + `脑图${s.vizN}/${s.litN}`);
+      + `脑图${s.vizN}/${s.litN}  3D帧${s.d3}/点数${s.pts}`);
     prev = s;
   }
 
@@ -126,6 +129,21 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   console.log(`  ${Math.abs(srvRate - 50) < 2.5 ? '✅ 速度恒定' : '❌ 速度不达标'}`);
   console.log(`  画面在动: ${samples.some(x => x.dFrame > 0) ? '是' : '否'}   `
     + `分数在涨: ${last.sc > 0 ? '是(' + last.sc + ')' : '尚未'}`);
+  // ---- ⚠️ 最关键的一条：**渲染循环本身有没有出错**。
+  // `loop()` 的 try/catch 会把每帧的异常吞进 DBG.err 并让绘制全部跳过 ——
+  // 症状是"游戏卡住 + 3D 面板全黑"，而 console 一个错都不报。
+  // 我因为这个漏掉过一个"引用了从未定义的常量"的致命 bug，所以这里显式检查。
+  if (last.err || last.errN > 0) {
+    console.log(`  ❌ 渲染循环出错 ${last.errN} 次：${String(last.err).split('\n')[0]}`);
+  } else {
+    console.log('  ✅ 渲染循环无错（DBG.err 为空）');
+  }
+  if (last.d3 > 0 && last.pts > 0) {
+    console.log(`  ✅ 3D 面板在画：${last.d3} 次渲染 / ${last.pts.toLocaleString()} 个点`);
+  } else {
+    console.log(`  ⚠️ 3D 面板没在画（draw_calls=${last.d3}，点数=${last.pts}）`);
+  }
+
   const realErrs = errs.filter(e => !/lastError|favicon/i.test(e));
   console.log(realErrs.length ? `  ❌ 异常: ${[...new Set(realErrs)].slice(0, 5).join(' | ')}` : '  ✅ 无异常');
   if (netErrs.length) console.log(`  网络失败: ${[...new Set(netErrs)].slice(0, 4).join(' | ')}`);

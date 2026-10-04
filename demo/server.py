@@ -434,7 +434,12 @@ class GameWorld:
         self.cause = cause
 
     def snapshot(self, **extra) -> dict:
-        """给前端的状态快照。刻意做小（前端每帧都要取）。"""
+        """给前端的状态快照。刻意做小（前端每帧都要取）。
+
+        前端会在**相邻两次快照之间**按本地到达时刻插值（见 demo/app.js 的
+        interpolate 与其中那段"保持+外推为什么会跳"的实测说明），
+        所以这里只要给出当前状态即可，不需要额外带上一步。
+        """
         d = {
             "t": round(self.t, 4),
             "y": round(self.y, 2),
@@ -628,6 +633,13 @@ class Session:
             st = dict(self.game_stats)
             snap = self.game.snapshot(**st)
             snap["sim_hz"] = SIM_HZ
+            # 加速期时长（秒）**必须下发给前端**，不能让前端自己写一份：
+            # 前端要用它判断"还在加速期 → 显示提示 / 先不做匀速外推"。
+            # 两边各存一份的后果是改了一边就悄悄不一致，而症状往往表现为
+            # "画面不动"这种看不出原因的样子。我就踩过一次：前端引用了一个
+            # **从未定义**的 `WARMUP_S`，每帧抛 ReferenceError 又被 loop() 的
+            # try/catch 吞掉 → 整个渲染循环静默死掉、3D 面板全黑。
+            snap["warm_s"] = self.game.WARM_S
             snap["need"] = 1
             # 最近一次脑读出的几个数（前端画曲线用）
             snap["dn01_recent"] = int(sum(self.dn_tick)) if self.dn_tick else 0

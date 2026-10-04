@@ -108,25 +108,35 @@ const SPRITE_ROT_MAX = 0.30;
 //      ② 把两次状态**插值**后画出来（所以画面是 60fps 流畅的）
 // 实测服务端速率：**50.0 步/秒，偏差 +0.1%**。
 
-/** 从服务端同步来的权威状态（后端的 _game_tick 每 50ms 更新一次）。 */
+/** 从服务端同步来的权威状态（后端的 _game_tick 每 20ms 更新一次）。 */
 function applyServerState(st) {
   if (!st || st.error) return;
+  const nowS = performance.now() / 1000;
+  // ---- 维护**最近两次状态**（各自带"到达本地的时刻"），插值就在这两者之间做。
+  //     为什么用到达时刻而不是服务端时刻：两者是同一个时钟吗？不是。
+  //     本地墙钟与服务端时钟之间有一个未知且会漂移的偏移，直接算会持续抖；
+  //     而"两次到达的本地时刻之差"与服务端走过的时间是同一段，
+  //     网络延迟在求商时自然抵消。详见 interpolate 的注释。
+  const prev = G.srvB;
+  G.srvA = prev ? { local: prev.local, t: prev.t, y: prev.y, vy: prev.vy,
+                    pipes: prev.pipes } : null;
+  // 管子存 [top, x] 的二元组（按 top 配对，不依赖数组下标）
+  G.srvB = { local: nowS, t: st.t, y: st.y, vy: st.vy,
+             pipes: (st.pipes || []).map(p => [p[1], p[0]]) };
   G.t = st.t;
   G.y = st.y;
   G.vy = st.vy;
-  G.prevY = (G.srvY === undefined) ? st.y : G.srvY;
   G.srvY = st.y;
   G.score = st.score; G.best = st.best;
   G.dead = !!st.dead; G.cause = st.cause || '';
   G.flapT = st.flap_t;
-  // 管道：服务端发的是 [x, top]
+  // 管道：服务端发的是 [x, top]。`x`/`top` 在这里作为**当前权威值**，
+  // 显示位置由 interpolate 按两次状态算出（见那里的说明）。
   const ps = st.pipes || [];
-  // 复用已有对象（避免每帧新建，也让插值能拿到上一帧的 x）
   if (!G.pipes || G.pipes.length !== ps.length) {
-    G.pipes = ps.map(([x, top]) => ({ x, top, px: x, passed: false }));
+    G.pipes = ps.map(([x, top]) => ({ x, top, passed: false }));
   } else {
     for (let i = 0; i < ps.length; i++) {
-      G.pipes[i].px = G.pipes[i].x;
       G.pipes[i].x = ps[i][0];
       G.pipes[i].top = ps[i][1];
     }
@@ -134,6 +144,8 @@ function applyServerState(st) {
   G.srvT = st.t;
   // 加速期的显示由**服务端时间**推导（服务端才是权威，别再本地积分一遍）
   G.warmupT = Math.max(G.warmupT || 0, st.t);
+  // 加速期时长由服务端下发（唯一来源，见 interpolate 的说明）
+  if (st.warm_s !== undefined) G.warmS = st.warm_s;
   G.srvRx = performance.now() / 1000;
   // ---- 画图要用的脑侧量。
   // 原来这些来自前端自己那次 /api/step 的响应；改成服务端权威后必须从
@@ -169,20 +181,47 @@ async function pollGame() {
   }
 }
 
-/** 渲染用插值：服务端 50 Hz、屏幕 60 fps，所以在两次状态之间按**本地墙钟**
- *  把鸟和管子推进到当前时刻，画面才连续（否则会一卡一卡）。
- *  只影响显示；判定完全在服务端。 */
+/** 渲染用插值：服务端 50 Hz、屏幕 60 fps。只影响显示，判定完全在服务端。
+ *
+ *  ## 为什么必须在**两个已知状态之间**插值
+ *
+ *  原来写的是"保持最新值 + 从它往前外推"：
+ *      y_display = srvY + vy * (now − srvRx)
+ *  **这会跳。** `(now − srvRx)` 每帧都在变，于是同一个服务端状态被复用好几帧、
+ *  每帧算出的位置都不同；下一帧收到新状态时基准一换，位置就跳一下。
+ *  实测逐帧位移：中位 2.70 px、p95 19.47 px、**最小 −52.11 px**（倒跳），
+ *  与公式预测的 2.7 / 20 / 倒跳完全吻合。视觉上就是"过了一根管子后跳掉一块"。
+ *
+ *  ## 为什么用「到达时刻」而不是「服务端时刻」
+ *
+ *  服务端在它自己的时间轴上给出 (prev_t, t)。但前端的墙钟和它不是一个钟，
+ *  两者之间有一个未知且会漂移的偏移量 —— 直接用服务器时间算 `u` 会持续抖。
+ *  所以这里用**两次状态各自到达本地的时刻**做插值：
+ *      A 在 aLocal 到（服务端 aT），B 在 bLocal 到（服务端 bT）
+ *      u = (now − aLocal) / (bLocal − aLocal)
+ *  因为 A→B 之间服务端和本地走过的时间是同一段，**网络延迟在求商时自然抵消**，
+ *  不需要对齐时钟，也不需要知道延迟是多少。
+ */
 function interpolate() {
   if (G.srvStats === undefined) return;
+  const A = G.srvA, B = G.srvB;          // {local, t, y, vy, pipes} 两次相邻状态
+  if (!A || !B || !(B.local > A.local)) return;
   const now = performance.now() / 1000;
-  let a = now - G.srvRx;
-  if (a < 0) a = 0;
-  if (a > 0.2) a = 0.2;                       // 别插太远
-  if (!G.dead && G.srvT !== undefined && G.srvT >= WARMUP_S) {
-    G.y = G.srvY + G.vy * a;                  // 匀速外推（一个 tick 内 vy 变化极小）
-    const dx = PX_PER_M * a * P.spd;
-    for (const p of G.pipes) {
-      if (p.px !== undefined) p.x = p.px - dx;   // 管子匀速左移，外推是精确的
+  let u = (now - A.local) / (B.local - A.local);   // 0 = A, 1 = B
+  if (!(u >= 0)) u = 0;
+  if (u > 1.3) u = 1.3;                            // 网络变慢时最多多推一点
+  const uc = Math.min(u, 1);
+  // 鸟的 y：两状态线性插值；超出部分用当前 vy 稍微外推，避免"卡住感"
+  G.y = A.y + (B.y - A.y) * uc + (u > 1 ? (u - 1) * (B.local - A.local) * G.vy : 0);
+  // 管子：按**缺口 top** 在 A/B 之间配对（不能按下标 —— 生成/回收时下标会错位，
+  // 会算出"管子往右跑"这种不可能的值）。管速恒定，所以 x 可以精确插值。
+  if (!G.dead && G.srvT >= (G.warmS || 0.8) && G.pipes) {
+    const aMap = new Map(A.pipes);      // top -> x
+    const bMap = new Map(B.pipes);
+    for (const q of G.pipes) {
+      const xa = aMap.get(q.top), xb = bMap.get(q.top);
+      if (xa === undefined || xb === undefined) continue;   // 刚生成/刚回收：这帧不画它
+      q.x = xa + (xb - xa) * uc + (u > 1 ? -PX_PER_M * P.spd * (u - 1) * (B.local - A.local) : 0);
     }
   }
 }
@@ -367,7 +406,7 @@ function drawGame() {
   drawGround(g);
   drawBirdSprite(g);
   drawScoreBig(g);
-  if ((G.warmupT || 0) < WARMUP_S) drawWarmup(g);
+  if ((G.warmupT || 0) < (G.warmS || 0.8)) drawWarmup(g);
 
   if (G.flashT > 0) { $('flash').className = 'on'; $('flash').innerHTML = '<span>跳!</span>'; }
   else $('flash').className = '';
@@ -528,6 +567,11 @@ function init3D() {
   three = { renderer, scene, camera, grp, geo, col, base, asset2pt, orbit, ovLit, ovViz,
             coords: S.coords,
             litAsset: S.info.lit.map(c => c.asset), litType: S.info.lit.map(c => c.type) };
+  // 排障用：控制台 `__three` 可以看面板真实状态（点数 / drawRange / 渲染尺寸）——
+  // 3D 面板是"静默失败"的重灾区：它挂了页面照跑、不报错，只是那块是黑的。
+  // 别只在某个副本里加这一行，否则两端会不一致（我踩过：探针只在运行目录里，
+  // 同步时被规范副本覆盖掉了，于是怎么测都说"3D 没渲染"）。
+  window.__three = three;
   resize();
 }
 
@@ -691,6 +735,21 @@ function loop(ts) {
     hud();
   } catch (e) {
     DBG.err = (e && e.stack) ? e.stack : String(e);
+    // ⚠️ **必须让它看得见。** 这个 try/catch 原来只写 DBG.err，而 DBG.err
+    //    除了控制台没人看 —— 于是"每帧都抛同一个异常"这种致命状态可以完全静默：
+    //    渲染循环每帧在异常处中断，游戏卡住、3D 面板全黑、HUD 不动，
+    //    而 console 一个错都不报。我就被一个**从未定义过的 `WARMUP_S`**
+    //    这样坑了很久（同一个函数名在别处有定义，所以看代码也容易漏）。
+    //    现在把错误显性打到状态栏；只打几次，避免每帧重排 DOM。
+    DBG.errN = (DBG.errN || 0) + 1;
+    if (DBG.errN === 1 || DBG.errN === 60 || DBG.errN % 600 === 0) {
+      const el = $('stat');
+      if (el) {
+        el.className = 'warn';
+        el.textContent = `⚠️ 渲染循环出错（第 ${DBG.errN} 次）：`
+          + String(DBG.err).split('\n').slice(0, 3).join(' | ');
+      }
+    }
   }
 }
 
