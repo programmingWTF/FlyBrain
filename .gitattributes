@@ -1,0 +1,32 @@
+# 行尾统一：仓库里一律存 LF，检出时**不做任何转换**。
+#
+# 为什么必须显式写：本机 `core.autocrlf=true`，它会拿启发式去猜哪些文件是"文本"。
+# 猜错的后果对**二进制**是致命的（.npz / .feather / .bin 都是压缩容器，
+# 里面任何一个 0x0D 0x0A 字节序列被替换就整个文件报废），
+# 而且本地看不出问题（工作区哈希可能仍一致），要等 Linux 服务器 clone 下来才炸。
+#
+# 部署目标是 Linux，所以统一 LF 最省事。
+
+# 默认：按内容自动判断，但检出时不做 CRLF 转换
+* text=auto eol=lf
+
+# ---- 二进制：绝不碰 ----
+*.npz       binary
+*.npy       binary
+*.feather   binary
+*.bin       binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.gz        binary
+
+# ---- 前端 vendor：第三方源码原样保留（避免与上游 diff）----
+demo/vendor/*.js   -text
+
+# ---- Windows 批处理必须 CRLF，否则 cmd.exe 解析会出问题 ----
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
