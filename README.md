@@ -197,10 +197,30 @@ if (G.y - BIRD_R <= p.top + BIRD_R
 | `src/fpv/` | LIF 脉冲内核、逼近通路解析、任务几何 |
 | `demo/` | 网页 demo（`server.py` + `app.js` + 三个离线校验器）。另见 `demo/README.md` |
 | `scripts/flappy_bench.py` | **离线评测台**：同一套物理与判定，可复现地量分数 / 消融 / 查死因 |
+| `scripts/bake_coords.py` | 把 51.5 MB 的 manifest **预烤**成 1.6 MB 坐标（让仓库自包含） |
 | `scripts/loom_*.py` | 逼近反射那一套实验（阈值、视野覆盖、机制） |
-| `data/` | 连接组资产（`.gitignore` 掉，用脚本重新生成） |
+| `data/` | 连接组资产。**只入库运行必需的 3 个**（见下），源数据用脚本重新生成 |
+| **`DEPLOY.md`** | **部署指南**（依赖、systemd、验收清单、排障表） |
+| **`DEPLOY_PROMPT.md`** | 可直接复制给服务器 Agent 的部署提示词 |
 | `ESCAPE.md` | **主要报告**：这条通路的完整量化分析（含全部负结果） |
 | `SCORE_PROMPT.md` / `HANDOFF.md` / `FINDINGS.md` / `PLAN.md` | 接手提示词与过程记录 |
+
+### 部署到服务器
+
+看 [`DEPLOY.md`](DEPLOY.md)。一句话版 —— **仓库是自包含的**：`data/` 里三个文件
+（`spiking_full.npz` 50 MB / `spiking_full.json` 226 KB / `coords.npz` 1.6 MB）已入库，
+`three.js` 也在 `demo/vendor/` 里，所以：
+
+```bash
+pip install numpy pandas torch --index-url https://download.pytorch.org/whl/cpu
+python demo/server.py --asset spiking_full --no-browser --port 8620
+```
+
+⚠️ **`--asset` 必须显式传 `spiking_full`**：默认值是 `spiking_circuit`，那个子图
+不含 LC4/LPLC2，而 Flappy 的所有感觉输入都打在这两个群上 ——
+用默认值的后果是**分数恒为 0，而且不报错**。
+
+本机实测：启动 **4.7 s**、内存 **483 MB**、`/api/step` 中位 **27 ms**。
 
 ---
 

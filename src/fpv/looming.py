@@ -40,6 +40,34 @@ ESCAPE_MOTOR = ["DNp01", "DNp04"]
 CONTROL_SENSE = ["LC10a"]
 
 
+_PRE: object = None            # None=未加载；False=没有；dict=已加载
+
+
+def _load_precomputed() -> dict | None:
+    """读 `data/coords.npz`（预烤坐标 + 关键群 + 逐侧索引）。
+
+    这是**可选**的加速/自包含路径：没有它一切照旧（退回读 feather 表）。
+    见 scripts/bake_coords.py。
+    """
+    global _PRE
+    if _PRE is None:
+        import os
+        cands = [ROOT / "data" / "coords.npz", ROOT.parent / "data" / "coords.npz"]
+        env = os.environ.get("FLAPPY_COORDS_NPZ")
+        if env:
+            cands.insert(0, pathlib.Path(env))
+        _PRE = False
+        for c in cands:
+            try:
+                if c.is_file():
+                    with np.load(c) as d:
+                        _PRE = {k: np.asarray(d[k]) for k in d.files}
+                    break
+            except Exception:                     # noqa: BLE001
+                continue
+    return _PRE or None
+
+
 def resolve(brain, names: list[str]) -> dict[str, torch.Tensor]:
     """精确 cell_type 名 -> 冻结资产里的子图索引（张量）。"""
     meta = pd.read_feather(DATA / "fafb_783_meta.feather")
@@ -103,6 +131,23 @@ def resolve_side(brain, names: list[str]) -> dict[str, dict[str, torch.Tensor]]:
     DNp01 的轴突越过中线，所以"同侧感觉 -> 对侧下行"是逃避方向的关键预测；
     要测它就必须能把刺激只打给一侧的 LC4。
     """
+    # 优先用**预烤**的逐侧索引（data/coords.npz 的 side_<类型>_<侧>）。
+    # 这样连 1.4 MB 的 cell_type 表都不必入库 —— 见 scripts/bake_coords.py。
+    pre = _load_precomputed()
+    if pre is not None:
+        out_pre: dict[str, dict[str, torch.Tensor]] = {}
+        for n in names:
+            d_pre = {}
+            for k, v in pre.items():
+                if not k.startswith("side_"):
+                    continue
+                _, nm, sd = k.split("_", 2)
+                if nm == n:
+                    d_pre[sd] = torch.as_tensor(v, dtype=torch.long, device=brain.device)
+            if d_pre:
+                out_pre[n] = d_pre
+        if out_pre:
+            return out_pre
     meta = pd.read_feather(DATA / "fafb_783_meta.feather")
     meta["id"] = meta["fafb_783_id"].astype("int64")
     meta["cell_type"] = meta["cell_type"].fillna("")

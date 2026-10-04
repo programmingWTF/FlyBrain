@@ -45,9 +45,64 @@ import numpy as np
 import torch
 
 HERE = pathlib.Path(__file__).resolve().parent
-ROOT = HERE.parent                                  # flyflappy/
-REPO = ROOT.parent                                  # FlyBrain/
+ROOT = HERE.parent                                  # 仓库根
 sys.path.insert(0, str(ROOT / "src"))
+
+# ---- 可选资产：全脑 manifest 与前端 vendor ----
+#
+# ⚠️ 历史背景：这个 demo 原来住在 `<大仓库>/flyflappy/demo/`，而全脑资产在
+#    `<大仓库>/data/brain/` 与 `<大仓库>/viewer/vendor/`，当时 `REPO = ROOT.parent`
+#    正好是大仓库根。后来项目被拆成**只含 Flappy 的独立仓库**（`flyflappy/`
+#    提为仓库根），`ROOT.parent` 就指到仓库外面去了。
+# 现在两边都能跑：优先用**本仓库自带**的，找不到再退回老的大仓库布局。
+#
+# ⚠️ 三条路径**必须一起改**，它们是配套的：
+#      ① 服务器读 manifest（localize_coords / load_manifest）
+#      ② 3D 点云端点 /api/coords.bin（依赖 ① 产出的 self.coords）
+#      ③ 前端 three.js 的 importmap（demo/index.html）+ 本文件的 /vendor/ 路由
+#    漏改任何一条的后果：**服务器照样起得来、Flappy 照样能玩**，但右侧脑图
+#    要么空白、要么 404 —— 不会报错，所以很容易被当成"面板就这样"。
+
+
+def _find_optional(*cands: pathlib.Path) -> pathlib.Path | None:
+    """按顺序返回第一个存在的**文件**；都不在就返回 None（不抛异常）。"""
+    for c in cands:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def _find_dir(*cands: pathlib.Path) -> pathlib.Path | None:
+    """按顺序返回第一个存在的**目录**；都不在就返回 None。"""
+    for c in cands:
+        try:
+            if c.is_dir():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+#: 全脑 manifest：骨架包围盒中心 → 解剖坐标。**没有它游戏照常，只是脑图点云为空。**
+def find_manifest() -> pathlib.Path | None:
+    env = os.environ.get("FLAPPY_BRAIN_MANIFEST")
+    return _find_optional(
+        *([pathlib.Path(env)] if env else []),
+        ROOT / "data" / "brain" / "manifest.json",         # 独立 Flappy 仓库（自带）
+        ROOT.parent / "data" / "brain" / "manifest.json",  # 老的大仓库布局
+    )
+
+
+#: three.js 所在目录。demo/vendor 优先（自包含），再退回 viewer/vendor。
+def find_vendor() -> pathlib.Path | None:
+    return _find_dir(
+        HERE / "vendor",                       # 本仓库自带 ← 首选
+        ROOT / "viewer" / "vendor",
+        ROOT.parent / "viewer" / "vendor",
+    )
 
 from fpv import looming                              # noqa: E402
 from fpv.spiking_brain import SpikingBrain           # noqa: E402
@@ -85,9 +140,78 @@ LIT_TYPES = ["LC4", "LPLC2", "DNp01", "DNp04", "LC10a", "DNp02", "DNp11"]
 
 
 # ------------------------------------------------------------------ 坐标
+def load_manifest() -> dict | None:
+    """读全脑 manifest；**不在就返回 None**（不抛异常）。
+
+    没有 manifest 时，视觉面板会退化成"所有点堆在原点"，但 Flappy 游戏、
+    脑仿真、分数**完全不受影响** —— 因为 manifest 只提供解剖坐标。
+    """
+    p = find_manifest()
+    if p is None:
+        print("  [提示] 没找到 data/brain/manifest.json —— 3D 脑图点云将为空，"
+              "其余功能正常。要恢复脑图：把该文件放到 data/brain/ 下，"
+              "或设环境变量 FLAPPY_BRAIN_MANIFEST 指向它。", flush=True)
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:                      # noqa: BLE001
+        print(f"  [警告] manifest 读取失败（{p}）：{e} —— 3D 脑图将为空", flush=True)
+        return None
+
+
+def coords_npz() -> pathlib.Path | None:
+    """预烤的坐标文件 `data/coords.npz`（由 `scripts/bake_coords.py` 生成）。
+
+    它把 manifest 里我们真正需要的三件事压成 ~1.6 MB：
+      · 每个神经元的归一化解剖坐标（右侧 3D 脑图按**真实解剖位置**摆点）
+      · 关键神经元的坐标（点亮那 556 个）
+      · 关键群的资产索引（LC4 / LPLC2 / DNp01 ...）
+    有它就**完全不需要 51.5 MB 的 manifest**，启动也更快 —— 这是仓库自包含的关键。
+    """
+    env = os.environ.get("FLAPPY_COORDS_NPZ")
+    return _find_optional(
+        *([pathlib.Path(env)] if env else []),
+        ROOT / "data" / "coords.npz",
+        ROOT.parent / "data" / "coords.npz",
+    )
+
+
+def precomputed() -> dict | None:
+    """读 `data/coords.npz`（一次性缓存）。没有任何预烤文件时返回 None。"""
+    global _PRECOMPUTED
+    if _PRECOMPUTED is not _UNSET:
+        return _PRECOMPUTED                       # type: ignore[return-value]
+    p = coords_npz()
+    if p is None:
+        _PRECOMPUTED = None
+        return None
+    try:
+        with np.load(p) as d:
+            _PRECOMPUTED = {k: np.asarray(d[k]) for k in d.files}
+    except Exception as e:                        # noqa: BLE001
+        print(f"  [警告] 预烤坐标读取失败（{p}）：{e} —— 退回 manifest", flush=True)
+        _PRECOMPUTED = None
+    return _PRECOMPUTED
+
+
+_UNSET = object()
+_PRECOMPUTED: object = _UNSET
+
+
 def load_coords(fafb_ids: set[str]) -> dict[str, list[float]]:
-    """fafb id -> 归一化到 [-1,1] 的解剖坐标（用 manifest 里该神经元粗几何的包围盒中心）。"""
-    mf = json.loads((REPO / "data" / "brain" / "manifest.json").read_text(encoding="utf-8"))
+    """fafb id -> 归一化到 [-1,1] 的解剖坐标（用 manifest 里该神经元粗几何的包围盒中心）。
+
+    优先用预烤的 `data/coords.npz`；没有才退回读 manifest。
+    """
+    pre = precomputed()
+    if pre is not None and "lit" in pre and "lit_node_id" in pre:
+        ids = pre["lit_node_id"].astype(np.int64)
+        xyz = pre["lit"].astype(np.float32)
+        return {str(int(i)): [float(v) for v in xyz[k]]
+                for k, i in enumerate(ids) if str(int(i)) in fafb_ids}
+    mf = load_manifest()
+    if mf is None:
+        return {}
     xs = mf["bbox"]
     ctr = np.array([(xs[0] + xs[3]) / 2, (xs[1] + xs[4]) / 2, (xs[2] + xs[5]) / 2])
     half = np.array([(xs[3] - xs[0]) / 2, (xs[4] - xs[1]) / 2, (xs[5] - xs[2]) / 2])
@@ -112,12 +236,21 @@ def build_all_coords(brain) -> np.ndarray:
     这是"能碾压 pinme 那个 demo"的关键：它的 16 万个点是按黄金角螺旋**摆**出来的，
     我们这里每个点都是 FlyWire 骨架的真实包围盒中心。
     """
-    mf = json.loads((REPO / "data" / "brain" / "manifest.json").read_text(encoding="utf-8"))
+    pre = precomputed()
+    if pre is not None and "all" in pre:
+        arr = pre["all"].astype(np.float32)
+        if arr.shape == (brain.N, 3):
+            return arr
+        print(f"  [警告] 预烤坐标形状 {arr.shape} 与资产 {brain.N} 不符 —— 退回 manifest",
+              flush=True)
+    mf = load_manifest()
+    arr = np.zeros((brain.N, 3), dtype=np.float32)
+    if mf is None:
+        return arr                                # 没有解剖坐标 → 全零（_retino_groups 会自行跳过）
     xs = mf["bbox"]
     ctr = np.array([(xs[0] + xs[3]) / 2, (xs[1] + xs[4]) / 2, (xs[2] + xs[5]) / 2])
     half = np.array([(xs[3] - xs[0]) / 2, (xs[4] - xs[1]) / 2, (xs[5] - xs[2]) / 2])
     pos_of = {str(int(i)): k for k, i in enumerate(np.asarray(brain.node_ids, dtype=np.int64))}
-    arr = np.zeros((brain.N, 3), dtype=np.float32)
     secs = mf["coarse"]["sections"]
     for i, n in enumerate(mf["neurons"]):
         j = pos_of.get(str(n["id"]))
@@ -141,9 +274,17 @@ class Session:
         self.asset = asset
         self.graph = "real"
         self.brain = self.base
-        self.g = looming.resolve(self.base, looming.LOOM_SENSE
-                                 + looming.ESCAPE_MOTOR + looming.CONTROL_SENSE
-                                 + ["DNp02", "DNp11"])
+        # 关键群：优先用预烤文件里存好的（那样连 meta 的 cell_type 都不需要）；
+        # 没有就按老路走 meta 解析。
+        _pre = precomputed()
+        if _pre and "key_LC4" in _pre:
+            self.g = {k[4:]: torch.as_tensor(_pre[k], dtype=torch.long,
+                                             device=self.base.device)
+                      for k in _pre if k.startswith("key_")}
+        else:
+            self.g = looming.resolve(self.base, looming.LOOM_SENSE
+                                     + looming.ESCAPE_MOTOR + looming.CONTROL_SENSE
+                                     + ["DNp02", "DNp11"])
         rng = np.random.default_rng(0)
         self.viz_idx = torch.as_tensor(
             rng.choice(self.base.N, size=min(VIZ_SAMPLE, self.base.N), replace=False),
@@ -527,7 +668,9 @@ class H(BaseHTTPRequestHandler):
         if path in ("/", ""):
             path = "/index.html"
         if path.startswith("/vendor/"):
-            f = REPO / "viewer" / "vendor" / path[len("/vendor/"):]
+            name = path[len("/vendor/"):]
+            vend = find_vendor()
+            f = (vend / name) if vend else (self.demo_dir / "vendor" / name)
         else:
             f = self.demo_dir / path.lstrip("/")
         try:
