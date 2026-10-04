@@ -69,7 +69,40 @@ def _load_precomputed() -> dict | None:
 
 
 def resolve(brain, names: list[str]) -> dict[str, torch.Tensor]:
-    """精确 cell_type 名 -> 冻结资产里的子图索引（张量）。"""
+    """精确 cell_type 名 -> 冻结资产里的子图索引（张量）。
+
+    **优先走预烤路径**（`data/coords.npz` 里的 `key_<名>` 数组），
+    只有预烤文件缺失/不适用时才退回读 51.5 MB 的 `fafb_783_meta.feather`。
+
+    为什么必须这样（原来这里**无条件**读 feather，是个坑）：
+      · `fafb_783_meta.feather` 是**连接组源数据**，按设计**不入库**
+        （见 README「数据来源」），所以一个干净的克隆根本跑不了评测台 ——
+        但仓库自带的 `data/coords.npz` 里已经有 `key_*` 了，本来就不需要它。
+      · 而且 `Session` 早就在走预烤路径了（`server.py` 里读 `key_*`），
+        两边行为不一致 → 同样的资产在网页和评测台上可能解析出不同的群。
+        现在两处都优先预烤。
+    """
+    pre = _load_precomputed()
+    if pre is not None:
+        N = brain.N
+        out_pre: dict[str, torch.Tensor] = {}
+        ok_all = True
+        for n in names:
+            k = "key_" + n
+            if k not in pre:
+                ok_all = False
+                break
+            arr = np.asarray(pre[k], dtype=np.int64)
+            # 索引必须在范围内：换过更小的资产时预烤索引会越界（这个坑服务器端
+            # 已经踩过一次，报出来的是跟根因毫无关系的 IndexError）
+            if len(arr) == 0 or int(arr.min()) < 0 or int(arr.max()) >= N:
+                ok_all = False
+                break
+            out_pre[n] = torch.as_tensor(np.sort(arr), dtype=torch.long,
+                                         device=brain.device)
+        if ok_all and out_pre:
+            return out_pre
+
     meta = pd.read_feather(DATA / "fafb_783_meta.feather")
     meta["id"] = meta["fafb_783_id"].astype("int64")
     meta["cell_type"] = meta["cell_type"].fillna("")

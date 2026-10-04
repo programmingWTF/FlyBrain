@@ -314,6 +314,9 @@ class GameWorld:
                  seed: int | None = None):
         self.max_climb = float(max_climb)
         self.first_gap_extra = float(first_gap_extra)
+        #: 关卡随机种子。`None` = 每局都不一样（网页用）；
+        #: 给一个整数 = 可复现的固定关卡序列（做对照实验用）。
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
         self.reset()
 
@@ -329,6 +332,10 @@ class GameWorld:
         self.spawned = 0
         self.cooldown = 0.0
         self.flap_t = 0.0                      # 最近一次拍翅的游戏时刻（给前端画翅膀）
+        # 重开一局时**重播同一个种子**，这样"同一关"是可复现的
+        # （网页上是随机关卡；做对照实验时必须能固定住）
+        if self.seed is not None:
+            self.rng = np.random.default_rng(self.seed)
         # 开局那根：与 app.js 一致 —— top=250，位置 birdX + 0.75m - pipeW
         self.pipes.append(dict(x=self.BIRD_X + 0.75 * self.PX_PER_M - self.PIPE_W,
                                top=250.0, passed=False))
@@ -448,7 +455,7 @@ class GameWorld:
 class Session:
     """一个持锁的活脑会话。"""
 
-    def __init__(self, asset: str, device: str):
+    def __init__(self, asset: str, device: str, start_loop: bool = True):
         self.lock = threading.Lock()
         self.base = SpikingBrain.from_npz(asset, device=device)
         self.base.gain, self.base.tonic = GAIN, TONIC
@@ -510,9 +517,17 @@ class Session:
         self.game_lock = threading.Lock()
         self.game_stats = dict(ticks=0, flaps=0, rate=0.0, dead=0, restarts=0)
         self._stop = False
-        self._thread = threading.Thread(target=self._game_loop, daemon=True,
-                                        name="flappy-sim")
-        self._thread.start()
+        if start_loop:
+            self._thread = threading.Thread(target=self._game_loop, daemon=True,
+                                            name="flappy-sim")
+            self._thread.start()
+
+    def close(self) -> None:
+        """停掉仿真线程（测试脚本用；进程退出时 daemon 线程本来也会走）。"""
+        self._stop = True
+        t = getattr(self, "_thread", None)
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)
 
     # ------------------------------------------------------------ 服务端锁步仿真
     def _game_tick(self) -> None:
@@ -532,6 +547,16 @@ class Session:
         self.brain.step(clamp=clamp)
         dn = int(self.brain.S[self.g["DNp01"]].sum())
         self.dn_tick.append(dn)
+        # ⚠️ 窗口计数必须与 `scripts/flappy_bench.py` 的 `recent` **同构**。
+        #    那边是：`recent.append(spk); if len(recent) > SPIKE_WINDOW: recent.pop(0)`
+        #    —— 空列表起步、只保留最近 5 个。
+        #    我原来用 `deque(maxlen=WINDOW)`，它**一开局就是 5 个 0**。
+        #    两者在开头都算 0，看起来一样，但一旦出现"一个 tick 里 DNp01 发放 2 次"
+        #    就开始分叉（实测：某 tick 服务端 spk=2 + 旧窗口残留 0，评测台只有
+        #    spk=1 且窗口已清空 → 服务端继续拍翅、评测台不拍 → 鸟的轨迹越差越远）。
+        #    这是 `verify_server_vs_bench.py` 逐 tick 抓出来的，不是猜的。
+        while len(self.dn_tick) > WINDOW:
+            self.dn_tick.popleft()
         flap = sum(self.dn_tick) >= 1
         # 手动接管（空格/点击）：人在场时优先于人，否则玩了半天没反应
         if getattr(self, "_manual_flap", False):
@@ -752,7 +777,9 @@ class Session:
 
     def reset(self):
         self.brain.reset()
-        self.dn_tick = deque(maxlen=WINDOW)
+        # 注意：**不要**用 maxlen —— 那会一开局就塞满 5 个 0，
+        # 而评测台的 recent 是空列表起步。见 _game_tick 里那段说明。
+        self.dn_tick = deque()
         self.dn04_tick = deque(maxlen=WINDOW)
         self.lr_tick = deque(maxlen=WINDOW)
         self.ticks_total = 0

@@ -115,6 +115,19 @@ class SpikingBrain:
         # 本步的突触电流缓冲（复用，避免每 tick 分配）
         self._cur = torch.zeros(self.N, dtype=torch.float32, device=self.device)
 
+        # ---- 噪声的**专属**随机流（见 step() 里那段说明）
+        # 原来噪声走全局 np.random / torch.rand，于是"同一个种子"保证不了可复现：
+        # 噪声序列取决于此前消耗了多少随机数。实测两个进程用同一个种子，
+        # 因为初始化消耗不同，脑的噪声从第一 tick 就分叉（膜电位差 0.674）。
+        # 现在每个脑有自己的 rng/tgen，`reset()` 按 `self.seed` 重置它们。
+        self.seed = int(meta.get("seed", 12345))
+        #: 噪声是否走**全局** RNG（旧行为，**不可复现**，只用于和旧结果对照）。
+        #: 默认 False = 走这个脑自己的流，同种子必然同轨迹。
+        self.legacy_noise = bool(meta.get("legacy_noise", False))
+        self.rng = np.random.default_rng(self.seed)
+        self.tgen = torch.Generator(device="cpu")
+        self.tgen.manual_seed(self.seed)
+
         # 关键神经元索引缓存
         self._key = meta.get("key_neurons", {})
         self._key_flat = {}
@@ -190,18 +203,43 @@ class SpikingBrain:
                 r = r + stim
             if add_noise and self.noise_amp > 0:
                 # 泊松噪声：每 tick 以 noise_hz*dt 概率给某些神经元加 noise_amp
+                #
+                # ⚠️ 噪声必须走**这个脑自己的** `self.rng` / `self.tgen`，
+                #    不能用全局的 `np.random.*` / `torch.rand`。
+                #
+                # 为什么（这是个真的坑，`scripts/verify_server_vs_bench.py` 抓出来的）：
+                # 原来这里用全局 RNG，于是"同一个种子"根本保证不了可复现 ——
+                # 噪声序列取决于**此前消耗了多少随机数**。实测两个进程
+                # （服务端 Session 与评测台 Harness）用同一个种子，
+                # 因为初始化时消耗的随机数个数不同，脑的噪声从第一 tick 就分叉：
+                # 喂**完全相同**的驱动，膜电位最大差 **0.674**、
+                # DNp01 的发放数也不一样（服务端 2 / 评测台 1）。
+                # 结果就是"两边用同一套代码同一个种子，却飞得完全不同"。
+                # 现在噪声流由 `self.tgen` 独占，`reset()` 时按 `self.seed` 重置，
+                # 所以"同种子 = 同噪声 = 同轨迹"，与调用方消耗了多少随机数无关。
                 p = self.noise_hz * self.dt
-                n_noisy = int(np.random.binomial(self.N, p))
+                if self.legacy_noise:                      # 旧行为（不可复现）
+                    n_noisy = int(np.random.binomial(self.N, p))
+                    idx = (torch.randint(0, self.N, (n_noisy,), device=self.device)
+                           if n_noisy else None)
+                else:
+                    n_noisy = int(self.rng.binomial(self.N, p))
+                    idx = (torch.randint(0, self.N, (n_noisy,), device=self.device,
+                                         generator=self.tgen)
+                           if n_noisy else None)
                 if n_noisy:
-                    idx = torch.randint(0, self.N, (n_noisy,), device=self.device)
                     r.index_add_(0, idx, torch.full((n_noisy,), self.noise_amp,
                                                     device=self.device))
             spike = r >= self.threshold
             if clamp is not None:
                 cidx, cp = clamp
                 prob = torch.as_tensor(cp, dtype=r.dtype, device=self.device)
-                forced = torch.rand(cidx.numel(), device=self.device,
-                                    dtype=r.dtype) < prob
+                if self.legacy_noise:
+                    forced = torch.rand(cidx.numel(), device=self.device,
+                                        dtype=r.dtype) < prob
+                else:
+                    forced = torch.rand(cidx.numel(), device=self.device,
+                                        dtype=r.dtype, generator=self.tgen) < prob
                 spike = spike.clone()
                 spike[cidx] = forced
             self.G = torch.where(spike, torch.zeros_like(r), r)
@@ -223,7 +261,24 @@ class SpikingBrain:
             cnt += int(self.S[idx].sum())
         return cnt / max(1, idx.numel() * ticks)
 
+    def set_seed(self, seed: int) -> None:
+        """设定噪声种子（会影响后续 reset 之后的噪声序列）。
+
+        有这个入口，才能做到"同种子 = 同噪声 = 同轨迹"：
+        评测台与网页服务端各自 `set_seed(seed)` 之后就应该逐 tick 一致，
+        与它们各自在初始化时消耗了多少全局随机数**无关**。
+        """
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(self.seed)
+        self.tgen = torch.Generator(device="cpu")
+        self.tgen.manual_seed(self.seed)
+
     def reset(self) -> None:
         self.G.zero_()
         self.S.zero_()
         self._cur.zero_()
+        # 噪声流也要回到种子起点 —— 否则"重开一局"会接着上一局的噪声往下走，
+        # 同一关重复跑两次结果不同（做对照实验时很致命）。
+        self.rng = np.random.default_rng(self.seed)
+        self.tgen = torch.Generator(device="cpu")
+        self.tgen.manual_seed(self.seed)

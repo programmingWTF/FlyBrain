@@ -1066,6 +1066,20 @@ class Harness:
 
     # ---- 坐标 / 视野轴（半球轴先剔除）
     def _coords(self) -> np.ndarray:
+        """每个神经元的解剖坐标（归一化到全脑包围盒）。
+
+        **优先用预烤的 `data/coords.npz['all']`**（1.6 MB，仓库自带），
+        只有它缺失/尺寸不匹配时才退回读 51.5 MB 的
+        `data/brain/manifest.json`（那是连接组源数据，按设计不入库）。
+
+        原来这里**无条件**读 manifest.json，导致一个干净的克隆跑不了评测台 ——
+        而仓库里本来就有预烤坐标。与 `Session` 的行为现在一致了。
+        """
+        pre = looming._load_precomputed()
+        if pre is not None and "all" in pre:
+            all_xyz = np.asarray(pre["all"], dtype=np.float32)
+            if all_xyz.shape == (self.brain.N, 3):
+                return all_xyz
         mf = json.loads((REPO / "data" / "brain" / "manifest.json").read_text(encoding="utf-8"))
         xs = mf["bbox"]
         ctr = np.array([(xs[0] + xs[3]) / 2, (xs[1] + xs[4]) / 2, (xs[2] + xs[5]) / 2])
@@ -1368,11 +1382,17 @@ def main() -> int:
     ap.add_argument("--need-spikes", type=int, default=1)
     ap.add_argument("--trace-mode", default=None, help="打印该模式的逐 tick 轨迹")
     ap.add_argument("--trace-n", type=int, default=80)
+    ap.add_argument("--legacy-noise", action="store_true",
+                    help="噪声走全局 RNG（旧行为，**不可复现**）；只用来核对旧数字")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     h = Harness(a.asset, gain=3.0, tonic=0.0, need_spikes=a.need_spikes,
                 cooldown=a.cooldown, oracle_look=a.oracle_look)
+    # 旧噪声模式（走全局 RNG）只用来核对历史数字；默认走可复现的脑内噪声流
+    h.brain.legacy_noise = bool(a.legacy_noise)
+    if a.legacy_noise:
+        print("⚠️ --legacy-noise：噪声走全局 RNG（旧行为），结果不可复现")
     print(f"资产 {a.asset}: N={h.brain.N:,}  E={len(h.brain.codes):,}  "
           f"gain={h.brain.gain} tonic={h.brain.tonic}  载入 {h.load_time:.1f}s")
     print(f"拍翅冷却 {h.cooldown}s   游戏常数 = demo/app.js（GRAV={GRAV} "
@@ -1439,6 +1459,9 @@ def main() -> int:
     out = pathlib.Path(a.out) if a.out else (ROOT / "output" / "flappy_bench.json")
     payload = dict(asset=a.asset, spec=spec, max_ticks=a.max_ticks, games=a.games,
                    seed=a.seed, summary=summary, rows=all_rows)
+    # 目录不存在就建。一个干净的克隆里没有 output/，原来会在**跑完所有实验、
+    # 马上就要出结果的时候**抛 FileNotFoundError —— 白跑一场，很打击人。
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"→ {out}")
     return 0
