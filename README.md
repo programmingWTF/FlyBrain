@@ -117,6 +117,36 @@ $PY scripts/flappy_bench.py --asset spiking_full --modes bidi --games 40 \
 
 ---
 
+## 算法教材
+
+`python scripts/make_doc_figures.py --out output/doc_figs`
+`python scripts/make_doc_page.py`（写到桌面）
+
+产出是一份**自包含 HTML 教材**（约 390 KB，双击即可离线阅读），20 节，分七部 + 附录：
+
+1. **全局** —— 五分钟看懂、20ms 闭环总图
+2. **计算基础** —— LIF 神经元、驱动门槛 `need = 0.06042` 的推导
+3. **感觉与指令** —— LC4/LPLC2 通路、几何→驱动、够不够触发的判据
+4. **反射** —— 双向逼近反射、回路闭合
+5. **游戏世界** —— 物理与像素语义、关卡生成
+6. **证据** —— 消融实验、逐 tick 对账、可复现性与噪声
+7. **工程** —— 为什么必须服务端、六个真实 bug、负结果
+8. **附录** —— 常见误解、术语表、一页带走
+
+写法上每节分三层（<span>直觉</span> / 形式 / 本项目具体数字），
+配手算算例、17 道可展开的自测题、常见误解与速查表。
+
+两条防脱节的措施：
+
+* **配图全部取自真实数据** —— 栅格图从跑着的仿真里逐 tick 取发放，
+  膜电位图按 LIF 公式逐步算出（读者可拿纸笔核对每一点），
+  分布图是真实生成器的 4000 次输出。
+* **正文里的常数直接从 `demo/server.py` 读**（`make_doc_page.py` 里 import），
+  所以改了代码重新生成，文档里的数字自动跟着变，不会出现"文档写 0.06、
+  代码是 0.05"这种情况。
+
+---
+
 ## 关卡生成：一个把生成器逼死的约束
 
 "相邻缺口的向上跳变不能超过执行器带宽"这条约束是对的（鸟一个间隔最多净爬约 125 px，
@@ -235,7 +265,7 @@ if (self.y - self.BIRD_R <= p["top"] + self.BIRD_R
 | `scripts/verify_server_vs_bench.py` | **控制回路端到端**：服务端 vs 评测台，同种子**逐 tick**（y/vy/发放/拍翅）对账 | 3 局 × ≥1071 tick，**逐 tick 一致、总分相同** |
 | `scripts/verify_server_gameplay.py` | 服务端真实 `Session._game_tick` 能拿多少分（可复现的固定种子） | 见脚本输出 |
 | `scripts/tune_levels.py` | 关卡生成的"随机性 vs 可玩性"参数扫描（可复跑） | 见脚本输出 |
-| `scripts/make_doc_figures.py` | 从**跑着的仿真**取数，生成文档配图（非示意图） | 220 tick 栅格 + 分布对照 |
+| `scripts/make_doc_figures.py` | 从**跑着的仿真**取数，生成教材配图（非示意图） | 闭环图 + 220 tick 栅格 + 膜电位算例 + 分布对照 |
 | `demo/verify_pipe_visual.js` | 管子形状不变量（不越出管宽、像素行连续、贴住画面上底） | ✅ |
 | `demo/verify_bird_volume.js` | 画出来的鸟外接半径 == 判定半径 | 17.00 px == 17 px ✅ |
 | `demo/check_syntax.mjs` | 批量语法检查（**不查未定义标识符**，见下） | ✅ |
@@ -404,7 +434,7 @@ requestAnimationFrame    → 28.2 次/s   （后台还会被完全暂停）
 | `scripts/verify_server_physics.py` | **物理等价性**：服务端 `GameWorld` vs 评测台 `World` 逐 tick 对账 |
 | `scripts/verify_server_vs_bench.py` | **控制回路等价性**：服务端 vs 评测台同种子逐 tick 对账（含脑） |
 | `scripts/verify_server_gameplay.py` | 量服务端真实得分（可复现固定种子） |
-| `scripts/make_doc_figures.py` / `make_doc_page.py` | 生成一份讲算法的自包含 HTML（配图取自真实仿真数据） |
+| `scripts/make_doc_figures.py` / `make_doc_page.py` | 生成一份**算法教材**（自包含 HTML，20 节，配图与正文常数都取自真实仿真与源码） |
 | `scripts/bake_coords.py` | 把 51.5 MB 的 manifest **预烤**成 1.6 MB 坐标（让仓库自包含） |
 | `scripts/loom_*.py` | 逼近反射那一套实验（阈值、视野覆盖、机制） |
 | `data/` | 连接组资产。**只入库运行必需的 3 个**（见下），源数据用脚本重新生成 |
