@@ -1,5 +1,11 @@
 """校验：服务端的 `GameWorld`（demo/server.py）与评测台的 `World`（scripts/flappy_bench.py）
-在**同一串拍翅命令**下必须逐 tick 等价。
+在**同一串拍翅命令 + 同一套管道布局**下必须逐 tick 等价。
+
+⚠️ 职责边界：这个脚本**只验物理**。两边现在用的关卡生成算法已经不同了
+（服务端 = 有界随机游走；评测台 = 旧的"从下方均匀抽样"，那个写法有缺口冻死的退化），
+所以这里把两侧的"下一根缺口"都替换成**同一串预生成的序列** ——
+管道布局因此逐根相同，任何分歧就只可能来自物理实现。
+`max_climb` / `gap_hi` 之类的生成参数对这里没有影响。
 
 为什么要这个脚本
 ----------------
@@ -55,6 +61,30 @@ def compare_one(seed: int, ticks: int, flap_seq: np.ndarray, *,
     bench.reset()
     srv.reset()
 
+    # ⚠️ **把两侧的关卡来源都换成同一串预生成的缺口序列**，这样这个脚本就
+    #    严格只验物理。为什么需要这么做：服务端与评测台现在用的生成算法
+    #    已经不同了（服务端 = 有界随机游走；评测台 = 旧的"从下方均匀抽样"，
+    #    那个写法有"缺口冻死"的退化）。如果两边各自生成，比较出来的差异
+    #    是生成算法的差异，不是物理的差异 —— 我一开始就是这么被绊住的。
+    #    `spacing()` 两边是同一套（同一个 SPACING + first_gap_extra），
+    #    所以只要缺口序列相同，生成出来的管道布局就逐根相同。
+    seq = np.random.default_rng(seed ^ 0x5EED).uniform(70.0, 260.0, 4096)
+    box_b = [0]
+    box_s = [0]
+
+    def _next_b():
+        v = float(seq[min(box_b[0], len(seq) - 1)])
+        box_b[0] += 1
+        return v
+
+    def _next_s():
+        v = float(seq[min(box_s[0], len(seq) - 1)])
+        box_s[0] += 1
+        return v
+
+    bench._next_gap_top = _next_b
+    srv._next_gap_top = _next_s
+
     # ⚠️ 冷却门必须在**喂进去之前**统一施加。
     #    为什么不能各自在内部管：评测台的 `World.step(flap)` 是**无条件**执行拍翅的
     #    （冷却由它的 harness 管），而服务端最初把冷却塞在 GameWorld 里 →
@@ -76,6 +106,13 @@ def compare_one(seed: int, ticks: int, flap_seq: np.ndarray, *,
     for i in range(ticks):
         f = bool(flap_seq[i])
         bench.step(f)
+        # ⚠️ 关卡生成**两侧已经不一样了**，而且这是有意的：
+        #    服务端 2026-10 换成了"以上一根缺口中心为中心的有界随机游走"，
+        #    评测台仍是从下方均匀抽样（旧实现，会有缺口冻死的退化）。
+        #    这个脚本的职责是**只验物理**，所以每 tick 把服务端的管道布局
+        #    强制对齐到评测台 —— 这样两边物理的输入完全相同，
+        #    任何分歧就一定是物理实现的问题，而不是关卡生成的问题。
+        #    （关卡生成的差异由 tune_levels.py 与 verify_server_vs_bench.py 各自负责。）
         srv.step(f)
 
         for name, a, b in (("y", bench.y, srv.y),

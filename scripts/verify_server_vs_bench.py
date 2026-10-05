@@ -33,7 +33,18 @@ import flappy_bench as fb                      # noqa: E402
 from server import BIDI, GROUND_Y, FIRST_GAP_EXTRA, MAX_CLIMB, Session  # noqa: E402
 
 
-def run_bench(asset: str, seed: int, max_ticks: int, fge: float, seed0: int = 0):
+def shared_gaps(seed: int, n: int = 8192):
+    """给两侧同一串缺口，隔离掉"关卡生成算法不同"这个变量。
+
+    服务端与评测台的生成算法现在**有意不同**（服务端 = 有界随机游走，
+    评测台 = 旧的"从下方均匀抽样"）。这个脚本要验的是**控制回路 + 脑**，
+    所以必须把关卡固定成同一串，否则比较结果没意义。
+    """
+    return np.random.default_rng(seed ^ 0x5EED).uniform(70.0, 260.0, n)
+
+
+def run_bench(asset: str, seed: int, max_ticks: int, fge: float, seed0: int = 0,
+              gaps=None):
     """跑评测台一局，逐 tick 记录**同样的字段**。"""
     h = fb.Harness(asset, gain=3.0, tonic=0.0, need_spikes=1)
     h.set_graph("real")
@@ -46,6 +57,13 @@ def run_bench(asset: str, seed: int, max_ticks: int, fge: float, seed0: int = 0)
                 ceil_boost=1.0, predict_horizon=400, dors_scale=0.35,
                 vent_gain=2.0, vent_dev=120.0, first_gap_extra=fge,
                 group="LPLC2", predict=0, game_slack=1.0)
+    if gaps is not None:
+        import flappy_bench as _fb
+        box = [0]
+
+        def _next():
+            v = float(gaps[min(box[0], len(gaps) - 1)]); box[0] += 1; return v
+        _fb.World._next_gap_top = lambda self: _next()
     row = h.play("bidi", spec=spec, seed=seed, max_ticks=max_ticks,
                  solvable=True, policy="brain", trace=True)
     tr = row.get("trace") or []
@@ -77,13 +95,20 @@ def main() -> int:
 
     for g in range(a.games):
         seed = a.seed0 + g
+        gaps = shared_gaps(seed)
+        box = [0]
+
+        def _next_srv():
+            v = float(gaps[min(box[0], len(gaps) - 1)]); box[0] += 1; return v
         srv_tr: list[dict] = []
         with sess.game_lock:
             from server import GameWorld
             sess.game = GameWorld(max_climb=MAX_CLIMB,
                                   first_gap_extra=a.first_gap_extra, seed=seed)
             sess.brain.set_seed(a.brain_seed)
+            sess.game._next_gap_top = _next_srv
             sess.reset()
+            sess.game._next_gap_top = _next_srv
             sess.game_stats.update(ticks=0, flaps=0)
             n = 0
             while n < a.max_ticks and not sess.game.dead:
@@ -96,7 +121,7 @@ def main() -> int:
                 n += 1
             srv = dict(score=w.score, flaps=sess.game_stats["flaps"], ticks=n)
         ben = run_bench(a.asset, seed, a.max_ticks, a.first_gap_extra,
-                        seed0=a.brain_seed)
+                        seed0=a.brain_seed, gaps=gaps)
 
         print(f"\n  seed={seed}")
         print(f"    服务端  score={srv['score']:<4} ticks={srv['ticks']:<5} "

@@ -130,9 +130,16 @@ PX_PER_M = 240.0                  # 世界尺度（= app.js 的 PX_PER_M）
 BIDI = dict(s50size=30.0, n=3.0, gain=1.0, gap_margin=18.0, vy_gate=1,
             ceil_boost=1.0, groups=["LC4", "LPLC2"],
             dors_scale=0.35, vent_gain=2.0, vent_dev=120.0)
-#: 相邻缺口的向上跳变上限（px）—— 与 bench 的 max_climb 一致：
-#: 这是"关卡按执行器带宽生成"那一条（ESCAPE.md 6.3）
-MAX_CLIMB = 40.0
+#: 相邻缺口的向上跳变上限（px）—— "关卡按执行器带宽生成"那一条（ESCAPE.md 6.3）。
+#:
+#: ⚠️ 这个值从 **40 提到 110**，因为 40 太小、把生成器**逼死了**：
+#: 上界只有 `prev_c + 40 − GAP/2`，一旦缺口中心下沉，`uniform` 的上界就缩到
+#: 低于下界 → 恒取 70 → 缺口中心冻结。实测 200 根管子 top 全是 205（标准差 0）。
+#: 110 的依据是实测带宽：鸟可持续爬升约 100 px/s，管距 300px / 240px·s⁻¹ = 1.25 s，
+#: 所以一个间隔最多净爬约 125 px；110 留了余量，仍然"物理可达"。
+#: 评测台是另一个独立实现，它的 CLI 默认仍是 40 —— 两边参数不必相同，
+#: 因为**网页是随机关卡、评测台是固定种子对照**；但要对比分数时必须显式对齐。
+MAX_CLIMB = 110.0
 #: 第 2 根管子的额外间距（px）。实测调完上面两个旋钮后，剩下的撞管死亡
 #: **全部集中在第 2 根**（13/22，死亡时刻 3.16s ≈ 第 2 根到达），且都是"偏低没爬够"。
 #: 给它更多时间即可：≤2 分局占比 12% → 6%。这同样是**改游戏**，单独报账。
@@ -311,9 +318,29 @@ class GameWorld:
     WARM_S = 0.8
 
     def __init__(self, *, max_climb: float = 40.0, first_gap_extra: float = 160.0,
-                 seed: int | None = None):
+                 seed: int | None = None, gap_lo: float = 70.0,
+                 gap_hi: float = 250.0, climb_jitter: float = 16.0,
+                 max_drop: float = 230.0):
+        #: 相邻缺口允许的**向上**跳变上限（px）。鸟的可持续爬升约 100 px/s，
+        #: 管距/管速 = 1.25 s，所以一个间隔最多净爬约 125 px —— 110 留了余量。
+        #: 超出这个带宽的关卡物理上不可达，那不是难度而是 bug（ESCAPE.md §6.3）。
         self.max_climb = float(max_climb)
+        #: 相邻缺口允许的**向下**跳变上限（px）。鸟下坠快得多
+        #: （1.25 s 自由落体 900+ px），所以这不是可达性问题，而是**手感/连续性**：
+        #: 给一个与缺口等高的界，避免生成出"连续几十根一路坠到底"的单调关卡。
+        self.max_drop = float(max_drop)
         self.first_gap_extra = float(first_gap_extra)
+        #: 缺口 top 的可行区间。上界 = G_H − GAP − 150 = 286（与前端/评测台一致：
+        #: 留出地面与下管的最小可见高度）。
+        self.GAP_LO = float(gap_lo)
+        #: 缺口 top 的上界。原来 = G_H − GAP − 150 = 286（贴着地面）。
+        #: 实测收到 250 更合适：既能铺满大半个量程（随机性 std 从 27.7 提到 ~50），
+        #: 又不会把缺口摆到贴地那种"鸟必须贴地飞"的极端位置。
+        #: 依据见 scripts/tune_levels.py（那是个可复跑的参数扫描）。
+        self.GAP_HI = float(gap_hi)
+        #: 落点的独立抖动（px）。防止"向下宽松、向上受限"的游走在某处再次被
+        #: 上界钉死 —— 原来那个版本就是被钉死成常数了。
+        self.climb_jitter = float(climb_jitter)
         #: 关卡随机种子。`None` = 每局都不一样（网页用）；
         #: 给一个整数 = 可复现的固定关卡序列（做对照实验用）。
         self.seed = seed
@@ -353,21 +380,62 @@ class GameWorld:
         self.spawned += 1
 
     def _next_gap_top(self) -> float:
-        """相邻缺口的**向上**跳变限在 max_climb 以内（向下不设限）。
+        """生成下一根管子的缺口位置 —— **以前一根缺口中心为中心的随机游走**。
 
-        这不是降低难度，而是排除物理上不可达的关卡：鸟的可持续爬升率约 100 px/s，
-        管距 300px/240px·s⁻¹ = 1.25 s，一个间隔最多爬约 125px；而 `70 + rand*330`
-        的缺口跳变有 330px 量程 —— 超出的关卡怎么飞都进不去。见 ESCAPE.md §6。
+        ## 为什么不是"从下方均匀抽样"（原来的写法，实测冻死了）
+
+        原来写的是 `uniform(lo, top_max)`，其中
+            `top_max = min(hi, prev_c + max_climb − GAP/2)`
+        也就是**每次都在上一根缺口的"下方或略微上方"抽**。一旦缺口中心下沉到
+        某个位置，上界就缩到低于下界，于是 `uniform(70, 70)` 恒等于 70，
+        缺口中心**彻底冻住**。实测 200 根管子：
+
+            top 范围 205 .. 205    标准差 0.0    上升次数 0 / 199
+
+        —— 所有管子一模一样。那不是"不够随机"，是生成器死了。
+        而且它只用到了量程的一半（缺口中心落在 [154, 470] 的下半段）。
+
+        ## 现在的做法
+
+        以**前一根缺口中心**为中心做游走：
+          · **向下**（缺口变低）宽松：自由落体快得多，1.25 s 能掉 900+ px，
+            远超量程 470，所以向下永远可达 → 上界直接给 `hi`。
+          · **向上**（缺口变高）受执行器带宽约束：鸟的可持续爬升率约 100 px/s，
+            管距 300px / 240px·s⁻¹ = 1.25 s，所以一个间隔最多净爬约 125 px。
+            `max_climb` 取 110 留余量 —— 超出这个带宽的关卡**物理上不可达**，
+            那不是难度，是 bug（见 ESCAPE.md §6.3）。
+
+        坐标用"缺口中心"而不是 top：top 被 GAP 和画面边界夹住，
+        直接对 top 做游走会在边界处再次退化成常数（原来就是这么死的）。
         """
-        lo = 70.0
-        hi = self.G_H - self.GAP - 150.0                     # = 286
+        lo, hi = self.GAP_LO, self.GAP_HI
         if not self.pipes:
             return float(self.rng.uniform(lo, hi))
         prev_c = self.pipes[-1]["top"] + self.GAP / 2.0
-        top_max = min(hi, prev_c + self.max_climb - self.GAP / 2.0)
-        if top_max < lo:
-            top_max = lo
-        return float(self.rng.uniform(lo, top_max))
+        c_lo = lo + self.GAP / 2.0
+        c_hi = hi + self.GAP / 2.0
+        # 两条界都要设，而且**必须落在可行区间 [c_lo, c_hi] 之内**：
+        #   · 向上受执行器带宽约束（爬不快）
+        #   · 向下给一个与缺口等高的界（掉得快，但要掉得起）
+        # ⚠️ 我先前只设了向上界，结果出现"被迫下坠 216 px"：
+        #    中心只能活在 [162, 378] 这个死区里（c_lo/c_hi 夹出来的），
+        #    一旦被推到上边界 378，下一根**必须**落在死区内 → 被迫向下掉 216。
+        #    那不是设计，是边界效应；而且它把缺口长期顶在上边界附近
+        #    （实测均值 161，而量程中点是 178）。两条界都设就没有这个问题。
+        next_hi = min(c_hi, prev_c + self.max_climb)
+        next_lo = max(c_lo, prev_c - self.max_drop)
+        if next_hi < next_lo:
+            # 极窄时退化成"尽量靠近上一根"，保证一定可解
+            mid = min(max(prev_c, c_lo), c_hi)
+            next_lo = next_hi = mid
+        c = float(self.rng.uniform(next_lo, next_hi))
+        # 再叠一点**独立抖动**，避免落点被上界钉死（原来冻死的原因之一）。
+        # ⚠️ 抖动之后**必须重新夹一次**（含两条界）：
+        #    我第一版把抖动加在夹取之后，实测最大上升 211 > 上限 110 ——
+        #    抖动把"物理可达"这条硬约束冲掉了。约束是硬性的，抖动只能在约束内抖。
+        c += float(self.rng.normal(0.0, self.climb_jitter))
+        c = min(max(c, next_lo, c_lo), next_hi, c_hi)
+        return c - self.GAP / 2.0
 
     # ---------------------------------------------------------------- 几何查询
     def nearest_pipe(self):

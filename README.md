@@ -117,6 +117,43 @@ $PY scripts/flappy_bench.py --asset spiking_full --modes bidi --games 40 \
 
 ---
 
+## 关卡生成：一个把生成器逼死的约束
+
+"相邻缺口的向上跳变不能超过执行器带宽"这条约束是对的（鸟一个间隔最多净爬约 125 px，
+更大的跳变物理上飞不进去）。但**原来的实现方式让它退化了**：
+
+```python
+# 旧：从下方均匀抽样
+uniform(lo, min(hi, prev_c + max_climb - GAP/2))
+```
+
+一旦缺口中心下沉，这个上界就缩到**低于下界**，于是退化成 `uniform(70, 70)` —— 恒等于 70。
+实测 200 根管子：**top 全是同一个值、标准差 0.0、上升次数 0/199**。
+那不是"不够随机"，是生成器死了；而且只用到量程的一半。
+
+现在改成**以上一根缺口中心为中心的有界随机游走**，两条界都设：
+
+```python
+next_hi = min(c_hi, prev_c + max_climb)    # 向上：受执行器带宽约束（110 px）
+next_lo = max(c_lo, prev_c - max_drop)     # 向下：给一个与缺口等高的界（230 px）
+c = uniform(next_lo, next_hi) + N(0, 16²)  # 再叠独立抖动
+c = clip(c, next_lo, next_hi, c_lo, c_hi)  # 抖动之后必须重新夹
+```
+
+两个容易踩的点，都写在代码注释里了：
+
+1. **抖动必须夹在约束之内。** 我第一版把抖动加在夹取**之后**，
+   实测最大上升 211 px，超过了 110 的上限 —— 抖动把"物理可达"这条硬约束冲掉了。
+2. **只设向上界不够。** 那样缺口中心只能活在 `[c_lo, c_hi]` 死区里，
+   一旦被推到边界，下一根**必须**落在死区内 → 被迫向下掉 216 px。
+   这不是设计，是边界效应。
+
+效果：缺口 top 从"恒定一个值"变成覆盖 70..250 全量程、标准差约 50 px。
+代价是单局均分从约 36 降到约 31（20 局口径，在方差内）。
+参数扫描见 `scripts/tune_levels.py`。
+
+---
+
 ## 分数是怎么一步步上去的
 
 离线评测台 `scripts/flappy_bench.py`，前几档 200 局/条件：
@@ -197,6 +234,8 @@ if (self.y - self.BIRD_R <= p["top"] + self.BIRD_R
 | `demo/verify_page.js` | **浏览器验收**：页面无异常、渲染帧率、服务端仿真速率是否恒定 | 60.0 fps / **50.05 步每秒** ✅ |
 | `scripts/verify_server_vs_bench.py` | **控制回路端到端**：服务端 vs 评测台，同种子**逐 tick**（y/vy/发放/拍翅）对账 | 3 局 × ≥1071 tick，**逐 tick 一致、总分相同** |
 | `scripts/verify_server_gameplay.py` | 服务端真实 `Session._game_tick` 能拿多少分（可复现的固定种子） | 见脚本输出 |
+| `scripts/tune_levels.py` | 关卡生成的"随机性 vs 可玩性"参数扫描（可复跑） | 见脚本输出 |
+| `scripts/make_doc_figures.py` | 从**跑着的仿真**取数，生成文档配图（非示意图） | 220 tick 栅格 + 分布对照 |
 | `demo/verify_pipe_visual.js` | 管子形状不变量（不越出管宽、像素行连续、贴住画面上底） | ✅ |
 | `demo/verify_bird_volume.js` | 画出来的鸟外接半径 == 判定半径 | 17.00 px == 17 px ✅ |
 | `demo/check_syntax.mjs` | 批量语法检查（**不查未定义标识符**，见下） | ✅ |
@@ -365,6 +404,7 @@ requestAnimationFrame    → 28.2 次/s   （后台还会被完全暂停）
 | `scripts/verify_server_physics.py` | **物理等价性**：服务端 `GameWorld` vs 评测台 `World` 逐 tick 对账 |
 | `scripts/verify_server_vs_bench.py` | **控制回路等价性**：服务端 vs 评测台同种子逐 tick 对账（含脑） |
 | `scripts/verify_server_gameplay.py` | 量服务端真实得分（可复现固定种子） |
+| `scripts/make_doc_figures.py` / `make_doc_page.py` | 生成一份讲算法的自包含 HTML（配图取自真实仿真数据） |
 | `scripts/bake_coords.py` | 把 51.5 MB 的 manifest **预烤**成 1.6 MB 坐标（让仓库自包含） |
 | `scripts/loom_*.py` | 逼近反射那一套实验（阈值、视野覆盖、机制） |
 | `data/` | 连接组资产。**只入库运行必需的 3 个**（见下），源数据用脚本重新生成 |
